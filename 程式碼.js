@@ -194,10 +194,14 @@ function doGet(e) {
     var purgeRowCount = purgeDays * 1440;
 
     if (updatedRows > maxRowsAllowed) {
-        var deleteStartRow = updatedRows - purgeRowCount + 1;
-        totalDataSheet.deleteRows(deleteStartRow, purgeRowCount);
+       var deleteStartRow = updatedRows - purgeRowCount + 1;
+    try {
+        backupRowsBeforePurge_(totalDataSheet, deleteStartRow, purgeRowCount);
+    } catch (err) {
+        console.error("封存失敗，仍繼續刪除以避免資料表無限增長: " + err.message);
     }
-
+    totalDataSheet.deleteRows(deleteStartRow, purgeRowCount);
+}
     var lastDataTimeStr = SCRIPT_PROPS.getProperty("LAST_DATA_TIME");
     if (lastDataTimeStr) {
         var lastDataTime = parseInt(lastDataTimeStr);
@@ -369,7 +373,64 @@ function checkEspStatusAndInsertBlank() {
         dataSheet.getRange(2, 1, 1, 14).setValues([[dateStr, timeStr, "", "", "", "", "", "", "", "", "斷線", "", "", ""]]);
     }
 }
+// ======================== 🗄️ Purge前自動封存（依月份分頁） ========================
+function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
+    var archiveId = SCRIPT_PROPS.getProperty("ARCHIVE_FILE_ID");
+    if (!archiveId) {
+        console.error("尚未設定 ARCHIVE_FILE_ID，略過封存（請先執行 setupArchiveFile 建立封存檔）");
+        return;
+    }
+    var archiveSS = SpreadsheetApp.openById(archiveId);
 
+    var lastCol = Math.max(sourceSheet.getLastColumn(), 20); // 確保含A~T
+    var dataToArchive = sourceSheet.getRange(startRow, 1, numRows, lastCol).getValues();
+
+    var rowsByMonth = {};
+    for (var i = 0; i < dataToArchive.length; i++) {
+        var row = dataToArchive[i];
+        var dateVal = row[0];
+        var monthKey;
+        if (dateVal instanceof Date) {
+            monthKey = Utilities.formatDate(dateVal, "GMT+8", "yyyy-MM");
+        } else if (typeof dateVal === "string" && dateVal.indexOf("/") > -1) {
+            var parts = dateVal.split("/");
+            monthKey = parts[0] + "-" + ("0" + parts[1]).slice(-2);
+        } else {
+            monthKey = Utilities.formatDate(new Date(), "GMT+8", "yyyy-MM");
+        }
+        if (!rowsByMonth[monthKey]) rowsByMonth[monthKey] = [];
+        rowsByMonth[monthKey].push(row);
+    }
+
+    var headers = ["日期", "時間", "溫度", "濕度", "氣壓", "校正光照", "PPFD",
+                    "土壤J", "土壤O", "土壤P", "狀態", "累積J", "累積O", "累積P",
+                    "日期時間(輔助,無秒)", "原始光照(未校正)", "太陽仰角",
+                    "光照可信度", "仰角修正測試值", "光感器2原始值"];
+
+    for (var monthKey in rowsByMonth) {
+        var sheetName = "ESP32備份" + monthKey;
+        var sheet = archiveSS.getSheetByName(sheetName);
+        if (!sheet) {
+            sheet = archiveSS.insertSheet(sheetName);
+            sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+            sheet.setFrozenRows(1);
+        }
+        var rowsForThisMonth = rowsByMonth[monthKey];
+        var appendStartRow = sheet.getLastRow() + 1;
+        sheet.getRange(appendStartRow, 1, rowsForThisMonth.length, headers.length)
+             .setValues(padRowsToLength_(rowsForThisMonth, headers.length));
+    }
+
+    console.log("已封存 " + dataToArchive.length + " 列到封存檔（依月份分頁），刪除前備份完成");
+}
+
+function padRowsToLength_(rows, targetLength) {
+    return rows.map(function (row) {
+        var padded = row.slice(0, targetLength);
+        while (padded.length < targetLength) padded.push("");
+        return padded;
+    });
+}
 // ======================== 🛡️ 核心 4 函式：每日 DLI 歷史紀錄結算與鎖定引擎 ========================
 function archiveDailyDLI() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
