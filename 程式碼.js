@@ -1253,53 +1253,7 @@ function backfillDailyStatsTableHistory() {
     console.log("歷史資料補算完成，共 " + dateList.length + " 天");
 }
 // ======================== 🤖 AI 匯出模式：跨分頁掃描 / 公式+值輸出 ========================
-function handleAIExport_(e) {
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheetName = e.parameter.sheet;
-    var rangeStr = e.parameter.range;
 
-    var result;
-
-    if (!sheetName) {
-        // 沒指定分頁 → 回傳整份試算表的「分頁分布」總覽
-        var sheets = ss.getSheets();
-        var sheetsInfo = [];
-        for (var i = 0; i < sheets.length; i++) {
-            var sh = sheets[i];
-            sheetsInfo.push({
-                name: sh.getName(),
-                index: i,
-                lastRow: sh.getLastRow(),
-                lastColumn: sh.getLastColumn(),
-                hidden: sh.isSheetHidden()
-            });
-        }
-        result = {
-            spreadsheetName: ss.getName(),
-            sheetCount: sheets.length,
-            sheets: sheetsInfo
-        };
-    } else {
-        // 指定分頁 → 回傳該分頁(或指定 range)的值 + 公式
-        var sheet = ss.getSheetByName(sheetName);
-        if (!sheet) {
-            result = { error: "找不到分頁：" + sheetName };
-        } else {
-            var targetRange = rangeStr ? sheet.getRange(rangeStr) : sheet.getDataRange();
-            result = {
-                sheetName: sheetName,
-                range: rangeStr || "(全部資料範圍)",
-                numRows: targetRange.getNumRows(),
-                numCols: targetRange.getNumColumns(),
-                values: targetRange.getValues(),
-                formulas: targetRange.getFormulas()  // 沒公式的儲存格是空字串 ""
-            };
-        }
-    }
-
-    return ContentService.createTextOutput(JSON.stringify(result))
-        .setMimeType(ContentService.MimeType.JSON);
-}
 function handleAIExport_(e) {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var sheetName = e.parameter.sheet;
