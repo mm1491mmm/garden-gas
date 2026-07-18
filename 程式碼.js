@@ -6,8 +6,8 @@ var LINE_USER_ID = SCRIPT_PROPS.getProperty("LINE_USER_ID");
 
 var PLANT_CODE_MAP = { "茉莉": "J", "桂花": "O", "朝天椒": "P" };
 
-var SENSOR_LAT = 21.96766;
-var SENSOR_LON = 120.75801;
+var SENSOR_LAT = Number(SCRIPT_PROPS.getProperty("SENSOR_LAT"));
+var SENSOR_LON = Number(SCRIPT_PROPS.getProperty("SENSOR_LON"));
 var TIMEZONE_OFFSET = 8;
 
 // BH1750擴散罩衰減校正係數(2026/07/15用7/6~7/8裸機晴天vs7/15加罩晴天跨日比對修正，
