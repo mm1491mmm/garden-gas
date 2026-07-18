@@ -1321,3 +1321,142 @@ function handleAIExport_(e) {
     return ContentService.createTextOutput(JSON.stringify(result))
         .setMimeType(ContentService.MimeType.JSON);
 }
+// ============================================================
+// 🌤️ 仰角修正曲線統計模組（2026/07新增）
+// ============================================================
+// 目的：累積「資訊總表」裡裸版(T欄)/罩版(P欄)比值，依仰角(Q欄)分桶，
+//       只採用可信度(R欄)≥90的樣本，持續收斂出穩定的仰角修正曲線。
+// 設計：累積式更新，只處理「上次統計過的最後一列」之後的新資料，
+//       不用每次全表重算，避免「資訊總表」13000+列造成逾時。
+
+const ELEV_CURVE_SHEET_NAME = '仰角修正曲線';
+const ELEV_CURVE_BIN_SIZE = 2; // 每桶涵蓋的仰角度數
+const ELEV_CURVE_MIN_CONFIDENCE = 90;
+
+function getOrCreateElevCurveSheet_(ss) {
+  var sheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(ELEV_CURVE_SHEET_NAME);
+    sheet.getRange(1, 1, 1, 6).setValues([[
+      '仰角區間下限', '仰角區間上限', '樣本數', '比值總和', '平均比值', '標準差'
+    ]]);
+  }
+  return sheet;
+}
+
+// 讀取既有桶次統計（樣本數、比值總和、平方和），回傳 map: binIndex -> {count, sum, sumSq}
+function loadExistingBins_(sheet) {
+  var lastRow = sheet.getLastRow();
+  var bins = {};
+  if (lastRow < 2) return bins;
+
+  var data = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
+  for (var i = 0; i < data.length; i++) {
+    var binLow = data[i][0];
+    var count = Number(data[i][2]) || 0;
+    var sum = Number(data[i][3]) || 0;
+    // 反推平方和：用既有標準差還原(近似值即可，因為每次都是增量疊加，累積誤差可忽略)
+    var std = Number(data[i][5]) || 0;
+    var mean = count > 0 ? sum / count : 0;
+    var sumSq = count > 0 ? count * (std * std + mean * mean) : 0;
+    var binIndex = Math.floor(binLow / ELEV_CURVE_BIN_SIZE);
+    bins[binIndex] = { count: count, sum: sum, sumSq: sumSq };
+  }
+  return bins;
+}
+
+function updateElevationCorrectionCurve() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var source = ss.getSheetByName('資訊總表');
+  if (!source) { console.error('找不到資訊總表分頁！'); return; }
+
+  var curveSheet = getOrCreateElevCurveSheet_(ss);
+
+  // 記錄上次統計到哪一列(用Script Properties存，避免每次全表重算)
+  var lastProcessedRowStr = SCRIPT_PROPS.getProperty('ELEV_CURVE_LAST_ROW');
+  var lastProcessedRow = lastProcessedRowStr ? Number(lastProcessedRowStr) : 0;
+
+  var lastRow = source.getLastRow();
+  if (lastRow < 2) return;
+
+  // 資訊總表是「新資料在最上方」(insertRowBefore(2))，所以「尚未處理的新資料」
+  // 是從第2列開始、往下數到「上次處理時的總列數」對應的那一列為止。
+  // 用總列數差值判斷這次要往下掃多少列新資料。
+  var totalRows = lastRow - 1; // 扣掉表頭
+  var newRowCount = lastProcessedRow === 0 ? totalRows : (totalRows - lastProcessedRow);
+  if (newRowCount <= 0) {
+    console.log('沒有新資料需要統計，略過本次執行');
+    return;
+  }
+  // 安全上限，避免單次掃描過量資料逾時(6分鐘執行限制)
+  var scanRows = Math.min(newRowCount, 5000);
+
+  // P欄(16)=罩版原始值, Q欄(17)=仰角, R欄(18)=可信度, T欄(20)=裸版原始值
+  var data = source.getRange(2, 16, scanRows, 5).getValues();
+
+  var bins = loadExistingBins_(curveSheet);
+
+  for (var i = 0; i < data.length; i++) {
+    var covered = data[i][0];      // P欄 罩版原始值
+    var elevation = data[i][1];    // Q欄 仰角
+    var confidence = data[i][2];   // R欄 可信度
+    var bare = data[i][4];         // T欄 裸版原始值
+
+    if (covered === '' || covered === null || isNaN(covered) || Number(covered) <= 0) continue;
+    if (bare === '' || bare === null || isNaN(bare)) continue;
+    if (elevation === '' || elevation === null || isNaN(elevation)) continue;
+    if (confidence === '' || confidence === null || isNaN(confidence)) continue;
+    if (Number(confidence) < ELEV_CURVE_MIN_CONFIDENCE) continue;
+
+    var ratio = Number(bare) / Number(covered);
+    var binIndex = Math.floor(Number(elevation) / ELEV_CURVE_BIN_SIZE);
+
+    if (!bins[binIndex]) bins[binIndex] = { count: 0, sum: 0, sumSq: 0 };
+    bins[binIndex].count += 1;
+    bins[binIndex].sum += ratio;
+    bins[binIndex].sumSq += ratio * ratio;
+  }
+
+  // 寫回：依binIndex排序後整批覆蓋寫入(桶數不多，全部重寫比逐筆定位更新更簡單可靠)
+  var binIndexList = Object.keys(bins).map(Number).sort(function(a, b) { return a - b; });
+  var outputRows = binIndexList.map(function(idx) {
+    var b = bins[idx];
+    var mean = b.sum / b.count;
+    var variance = (b.sumSq / b.count) - (mean * mean);
+    var std = variance > 0 ? Math.sqrt(variance) : 0;
+    return [
+      idx * ELEV_CURVE_BIN_SIZE,
+      (idx + 1) * ELEV_CURVE_BIN_SIZE,
+      b.count,
+      Math.round(b.sum * 10000) / 10000,
+      Math.round(mean * 10000) / 10000,
+      Math.round(std * 10000) / 10000
+    ];
+  });
+
+  if (outputRows.length > 0) {
+    // 先清掉舊資料列(保留表頭)，再整批寫入，避免桶次增減造成殘留列
+    var oldLastRow = curveSheet.getLastRow();
+    if (oldLastRow > 1) {
+      curveSheet.getRange(2, 1, oldLastRow - 1, 6).clearContent();
+    }
+    curveSheet.getRange(2, 1, outputRows.length, 6).setValues(outputRows);
+  }
+
+  SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', totalRows.toString());
+  console.log('仰角修正曲線更新完成，本次新增處理 ' + scanRows + ' 列，累積 ' + outputRows.length + ' 個仰角區間');
+}
+
+// 【手動工具】重置累積統計，重新從頭掃描全部歷史資料
+// 使用時機：改了ELEV_CURVE_BIN_SIZE或ELEV_CURVE_MIN_CONFIDENCE等參數後，
+// 舊桶次統計已經不適用，需要執行這個清空重來。
+function resetElevationCorrectionCurve() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var curveSheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
+  if (curveSheet) {
+    var lastRow = curveSheet.getLastRow();
+    if (lastRow > 1) curveSheet.getRange(2, 1, lastRow - 1, 6).clearContent();
+  }
+  SCRIPT_PROPS.deleteProperty('ELEV_CURVE_LAST_ROW');
+  console.log('仰角修正曲線統計已重置，下次執行updateElevationCorrectionCurve將從頭掃描全部歷史資料');
+}
