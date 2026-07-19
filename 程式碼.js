@@ -1394,6 +1394,23 @@ const ELEV_CURVE_SHEET_NAME = '仰角修正曲線';
 const ELEV_CURVE_BIN_SIZE = 2; // 每桶涵蓋的仰角度數
 const ELEV_CURVE_MIN_CONFIDENCE = 90;
 
+// 🆕 已知的感測器飽和上限常數，用來過濾封頂假訊號：
+// 0x23(罩版)全程都是MTreg=69，理論飽和值恆定為54612.5；
+// 0x5C(裸板)分兩個時期：改動前MTreg=69、改動後MTreg=31(2026/07/19起)，兩種飽和值都要排除。
+// ⚠️ 之後如果0x5C再換模組或改MTreg，記得回來更新這個陣列。
+const SATURATION_VALUES = [54612.5, 121556.86];
+const SATURATION_TOLERANCE = 1.0; // 誤差容許範圍(浮點/測量微幅波動)
+
+function isSaturatedOrInvalid_(value) {
+  if (value === '' || value === null || isNaN(value)) return true;
+  var v = Number(value);
+  if (v <= 0) return true; // 讀0但另一顆有值,判定感測器異常/掉線,不是真實暗場
+  for (var i = 0; i < SATURATION_VALUES.length; i++) {
+    if (Math.abs(v - SATURATION_VALUES[i]) < SATURATION_TOLERANCE) return true;
+  }
+  return false;
+}
+
 function getOrCreateElevCurveSheet_(ss) {
   var sheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
   if (!sheet) {
@@ -1416,7 +1433,6 @@ function loadExistingBins_(sheet) {
     var binLow = data[i][0];
     var count = Number(data[i][2]) || 0;
     var sum = Number(data[i][3]) || 0;
-    // 反推平方和：用既有標準差還原(近似值即可，因為每次都是增量疊加，累積誤差可忽略)
     var std = Number(data[i][5]) || 0;
     var mean = count > 0 ? sum / count : 0;
     var sumSq = count > 0 ? count * (std * std + mean * mean) : 0;
@@ -1425,7 +1441,6 @@ function loadExistingBins_(sheet) {
   }
   return bins;
 }
-
 function updateElevationCorrectionCurve() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var source = ss.getSheetByName('資訊總表');
@@ -1433,41 +1448,61 @@ function updateElevationCorrectionCurve() {
 
   var curveSheet = getOrCreateElevCurveSheet_(ss);
 
-  // 記錄上次統計到哪一列(用Script Properties存，避免每次全表重算)
   var lastProcessedRowStr = SCRIPT_PROPS.getProperty('ELEV_CURVE_LAST_ROW');
   var lastProcessedRow = lastProcessedRowStr ? Number(lastProcessedRowStr) : 0;
 
   var lastRow = source.getLastRow();
   if (lastRow < 2) return;
 
-  // 資訊總表是「新資料在最上方」(insertRowBefore(2))，所以「尚未處理的新資料」
-  // 是從第2列開始、往下數到「上次處理時的總列數」對應的那一列為止。
-  // 用總列數差值判斷這次要往下掃多少列新資料。
-  var totalRows = lastRow - 1; // 扣掉表頭
+  var totalRows = lastRow - 1;
   var newRowCount = lastProcessedRow === 0 ? totalRows : (totalRows - lastProcessedRow);
   if (newRowCount <= 0) {
     console.log('沒有新資料需要統計，略過本次執行');
     return;
   }
-  // 安全上限，避免單次掃描過量資料逾時(6分鐘執行限制)
   var scanRows = Math.min(newRowCount, 5000);
 
-  // P欄(16)=罩版原始值, Q欄(17)=仰角, R欄(18)=可信度, T欄(20)=裸版原始值
-  var data = source.getRange(2, 16, scanRows, 5).getValues();
+  // P欄(16)~T欄(20)維持原本欄位, 新增V欄(22)=裸版位置標記
+  var data = source.getRange(2, 16, scanRows, 7).getValues();
+  // data[i]: [0]P罩版 [1]Q仰角 [2]R可信度 [3]S仰角修正測試值 [4]T裸版 [5]U光罩位置 [6]V裸版位置
+
+  // 🆕 狀態延續：由舊到新順推裸版位置標記，銜接上次批次結尾記錄的狀態
+  var carryInState = SCRIPT_PROPS.getProperty('BARE_LOCATION_STATE') || '';
+  var chronological = data.slice().reverse(); // 反轉成「舊→新」時間順序
+  var locationStates = [];
+  var currentState = carryInState;
+  for (var c = 0; c < chronological.length; c++) {
+    var marker = chronological[c][6]; // V欄
+    if (marker && marker.toString().trim() !== '') {
+      currentState = marker.toString().trim();
+    }
+    locationStates.push(currentState);
+  }
+  locationStates.reverse(); // 轉回跟data相同的「新→舊」順序，方便對應index
 
   var bins = loadExistingBins_(curveSheet);
+  var skippedSaturated = 0;
+  var skippedShaded = 0; // 🆕 統計本次因遮蔭排除的筆數
 
   for (var i = 0; i < data.length; i++) {
-    var covered = data[i][0];      // P欄 罩版原始值
-    var elevation = data[i][1];    // Q欄 仰角
-    var confidence = data[i][2];   // R欄 可信度
-    var bare = data[i][4];         // T欄 裸版原始值
+    var covered = data[i][0];
+    var elevation = data[i][1];
+    var confidence = data[i][2];
+    var bare = data[i][4];
 
-    if (covered === '' || covered === null || isNaN(covered) || Number(covered) <= 0) continue;
-    if (bare === '' || bare === null || isNaN(bare)) continue;
     if (elevation === '' || elevation === null || isNaN(elevation)) continue;
     if (confidence === '' || confidence === null || isNaN(confidence)) continue;
     if (Number(confidence) < ELEV_CURVE_MIN_CONFIDENCE) continue;
+
+    // 🆕 排除裸板當時處於「遮陰」狀態的樣本(比對關鍵字,不要求完全等於,避免你手動輸入用詞略有差異)
+    var stateStr = locationStates[i] || '';
+    if (stateStr.indexOf('遮陰') !== -1 || stateStr.indexOf('遮蔭') !== -1) {
+      skippedShaded++;
+      continue;
+    }
+
+    if (isSaturatedOrInvalid_(covered)) { skippedSaturated++; continue; }
+    if (isSaturatedOrInvalid_(bare)) { skippedSaturated++; continue; }
 
     var ratio = Number(bare) / Number(covered);
     var binIndex = Math.floor(Number(elevation) / ELEV_CURVE_BIN_SIZE);
@@ -1478,7 +1513,6 @@ function updateElevationCorrectionCurve() {
     bins[binIndex].sumSq += ratio * ratio;
   }
 
-  // 寫回：依binIndex排序後整批覆蓋寫入(桶數不多，全部重寫比逐筆定位更新更簡單可靠)
   var binIndexList = Object.keys(bins).map(Number).sort(function(a, b) { return a - b; });
   var outputRows = binIndexList.map(function(idx) {
     var b = bins[idx];
@@ -1496,7 +1530,6 @@ function updateElevationCorrectionCurve() {
   });
 
   if (outputRows.length > 0) {
-    // 先清掉舊資料列(保留表頭)，再整批寫入，避免桶次增減造成殘留列
     var oldLastRow = curveSheet.getLastRow();
     if (oldLastRow > 1) {
       curveSheet.getRange(2, 1, oldLastRow - 1, 6).clearContent();
@@ -1504,13 +1537,18 @@ function updateElevationCorrectionCurve() {
     curveSheet.getRange(2, 1, outputRows.length, 6).setValues(outputRows);
   }
 
-  SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', totalRows.toString());
-  console.log('仰角修正曲線更新完成，本次新增處理 ' + scanRows + ' 列，累積 ' + outputRows.length + ' 個仰角區間');
-}
+  // 🆕 記錄這批次「最舊那一列」延續下來的狀態，供下次執行(更早的資料)銜接判斷
+  if (chronological.length > 0) {
+    SCRIPT_PROPS.setProperty('BARE_LOCATION_STATE', chronological[0][6] ? chronological[0][6].toString().trim() : currentState);
+  }
 
+  SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', (lastProcessedRow + scanRows).toString());
+
+  console.log('仰角修正曲線更新完成，本次新增處理 ' + scanRows + ' 列(過濾封頂/異常 ' + skippedSaturated + ' 筆、過濾遮蔭 ' + skippedShaded + ' 筆)，累積 ' + outputRows.length + ' 個仰角區間，目前進度 ' + (lastProcessedRow + scanRows) + '/' + totalRows);
+}
 // 【手動工具】重置累積統計，重新從頭掃描全部歷史資料
-// 使用時機：改了ELEV_CURVE_BIN_SIZE或ELEV_CURVE_MIN_CONFIDENCE等參數後，
-// 舊桶次統計已經不適用，需要執行這個清空重來。
+// 使用時機：改了ELEV_CURVE_BIN_SIZE、ELEV_CURVE_MIN_CONFIDENCE、SATURATION_VALUES等參數後，
+// 舊桶次統計已經不適用(可能混了污染樣本)，需要執行這個清空重來。
 function resetElevationCorrectionCurve() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var curveSheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
@@ -1519,5 +1557,6 @@ function resetElevationCorrectionCurve() {
     if (lastRow > 1) curveSheet.getRange(2, 1, lastRow - 1, 6).clearContent();
   }
   SCRIPT_PROPS.deleteProperty('ELEV_CURVE_LAST_ROW');
+  SCRIPT_PROPS.deleteProperty('BARE_LOCATION_STATE'); // 🆕 一併清掉裸板位置延續狀態，避免殘留舊狀態影響重跑結果
   console.log('仰角修正曲線統計已重置，下次執行updateElevationCorrectionCurve將從頭掃描全部歷史資料');
 }
