@@ -10,20 +10,17 @@ var SENSOR_LAT = Number(SCRIPT_PROPS.getProperty("SENSOR_LAT"));
 var SENSOR_LON = Number(SCRIPT_PROPS.getProperty("SENSOR_LON"));
 var TIMEZONE_OFFSET = 8;
 
-// BH1750擴散罩衰減校正係數(2026/07/15用7/6~7/8裸機晴天vs7/15加罩晴天跨日比對修正，
-// 單點峰值比對與DLI全日積分反推兩種獨立方法收斂在2.89~2.91，故定為2.9)
 var LIGHT_CORRECTION_FACTOR = 2.9;
 
-// ---- 仰角動態調整因子（實驗性，2026/07/17新增，僅寫入測試欄位S，尚未取代正式F欄）----
-// 依據：陽台原始值/官方站日射量(W/m2)比值，僅取直曬窗內樣本迴歸，對數擬合 R²=0.99
-// ratio(elev) = -17.95*ln(elev) + 103.26
-// 基準仰角87°（對應2.9係數當初校準時的正午峰值情境），該處adjustFactor=1.0
 var ELEV_ADJ_REFERENCE = 87;
 var ELEV_ADJ_MIN = 0.7;
 var ELEV_ADJ_MAX = 2.0;
 
+// 🆕 OTA逾時判定：從進入「⏳下載中」狀態算起，超過這個時間仍未偵測到版本吻合，判定失敗、停止自動重試
+var OTA_TIMEOUT_MS = 5 * 60 * 1000; // 5分鐘
+
 function getElevationAdjustmentFactor_(elevation, azimuth) {
-    if (!isBalconyLit_(elevation, azimuth)) return 1; // 窗外（遮蔽/散射）暫不修正
+    if (!isBalconyLit_(elevation, azimuth)) return 1;
     var ratio = -17.95 * Math.log(elevation) + 103.26;
     var refRatio = -17.95 * Math.log(ELEV_ADJ_REFERENCE) + 103.26;
     var factor = ratio / refRatio;
@@ -32,7 +29,6 @@ function getElevationAdjustmentFactor_(elevation, azimuth) {
 
 // ======================== 📡 核心 1：ESP32 打卡大門 (doGet) ========================
 function doGet(e) {
-    // ---- AI 匯出模式：獨立驗證，不動用主系統的 WEB_API_KEY ----
     if (e && e.parameter && e.parameter.mode === "export") {
         var exportKey = SCRIPT_PROPS.getProperty("EXPORT_API_KEY");
         if (!exportKey || e.parameter.key !== exportKey) {
@@ -42,11 +38,19 @@ function doGet(e) {
         return handleAIExport_(e);
     }
 
-    // ---- 以下為原本 ESP32 打卡邏輯 ----
     var now = new Date();
     var nowTime = now.getTime();
-    var dateStr = Utilities.formatDate(now, "GMT+8", "yyyy/MM/dd");
-    var timeStr = Utilities.formatDate(now, "GMT+8", "HH:mm:ss");
+
+    var isBackfill = (e.parameter && e.parameter.backfill === "1");
+    var recordDate = now;
+    if (isBackfill && e.parameter.ts) {
+        var tsNum = Number(e.parameter.ts);
+        if (!isNaN(tsNum) && tsNum > 0) {
+            recordDate = new Date(tsNum * 1000);
+        }
+    }
+    var dateStr = Utilities.formatDate(recordDate, "GMT+8", "yyyy/MM/dd");
+    var timeStr = Utilities.formatDate(recordDate, "GMT+8", "HH:mm:ss");
 
     if (!e || !e.parameter || e.parameter.key !== WEB_API_KEY) {
         console.warn("拒絕未授權的存取請求！");
@@ -70,7 +74,8 @@ function doGet(e) {
     var cleanSoilAgeO = sanitizeInput(e.parameter.soilAgeO, true);
     var cleanSoilAgeP = sanitizeInput(e.parameter.soilAgeP, true);
 
-    // ---- 第二顆 BH1750 光感器（ADDR接3.3V，位址0x5C）----
+    var cleanFwVersion = sanitizeInput(e.parameter.fwver, false);
+
     var cleanLight2 = sanitizeInput(e.parameter.light2, true);
     var rawLight2 = "";
 
@@ -79,17 +84,15 @@ function doGet(e) {
     var correctedLight = "";
     var solarElevation = "";
     var lightConfidence = "";
-    var elevAdjustedLight = "";   // 仰角修正測試值(寫入S欄，不影響正式F欄)
+    var elevAdjustedLight = "";
 
     if (cleanPres <= 900 || cleanPres > 1100) { cleanPres = ""; }
 
-    // BH1750休眠中(-2)是韌體主動判斷、非異常，跟「讀值異常」(<0其他情況)區分開，
-    // 讓試算表能顯示「夜間休眠中」而不是被歸類成感測器故障
     if (cleanLight === -2) {
         cleanLight = "";
         calcPPFD = "";
         rawLightUncorrected = "夜間休眠中";
-        solarElevation = Math.round(calculateSolarElevation_(now, SENSOR_LAT, SENSOR_LON) * 10) / 10;
+        solarElevation = Math.round(calculateSolarElevation_(recordDate, SENSOR_LAT, SENSOR_LON) * 10) / 10;
         lightConfidence = "";
     } else if (cleanLight <= -1) {
         cleanLight = "";
@@ -98,7 +101,7 @@ function doGet(e) {
         if (cleanLight < 1) { cleanLight = 0; }
         rawLightUncorrected = cleanLight;
 
-        var pos = calculateSolarPosition_(now, SENSOR_LAT, SENSOR_LON);
+        var pos = calculateSolarPosition_(recordDate, SENSOR_LAT, SENSOR_LON);
         solarElevation = Math.round(pos.elevation * 10) / 10;
 
         correctedLight = Math.round(cleanLight * LIGHT_CORRECTION_FACTOR * 10) / 10;
@@ -110,7 +113,6 @@ function doGet(e) {
         lightConfidence = calculateLightConfidence_(solarElevation);
     }
 
-    // 第二顆光感器：沿用同樣的休眠(-2)/異常(-1)判斷邏輯，僅寫入原始值(不做校正)
     if (cleanLight2 === -2) {
         rawLight2 = "夜間休眠中";
     } else if (cleanLight2 <= -1) {
@@ -168,7 +170,6 @@ function doGet(e) {
         Math.round(cumJ), Math.round(cumO), Math.round(cumP)
     ]]);
 
-    // P/Q/R/S欄：原始光照 / 太陽仰角 / 光照可信度 / 仰角修正測試值(S欄為新增)
     totalDataSheet.getRange(2, 16, 1, 4).setValues([[
         rawLightUncorrected,
         solarElevation,
@@ -176,17 +177,17 @@ function doGet(e) {
         elevAdjustedLight
     ]]);
 
-    // T欄：第二顆光感器(ADDR接3.3V，位址0x5C)原始lux值
     totalDataSheet.getRange(2, 20).setValue(rawLight2);
 
-    // 即時訊息新版面：A2~E2=日期時間溫濕氣壓、F2~H2=三株土壤濕度、
-    // C4~D4=光照與PPFD(獨立寫入，不與row2連續)
-    dliSheet.getRange(2, 1, 1, 5).setValues([[dateStr, timeStr, cleanTemp, cleanHum, cleanPres]]);
-    dliSheet.getRange(2, 6, 1, 3).setValues([[cleanSoilJ, cleanSoilO, cleanSoilP]]);
-    dliSheet.getRange("C4:D4").setValues([[correctedLight, calcPPFD]]);
+    if (!isBackfill) {
+        dliSheet.getRange(2, 1, 1, 5).setValues([[dateStr, timeStr, cleanTemp, cleanHum, cleanPres]]);
+        dliSheet.getRange(2, 6, 1, 3).setValues([[cleanSoilJ, cleanSoilO, cleanSoilP]]);
+        dliSheet.getRange("C4:D4").setValues([[correctedLight, calcPPFD]]);
 
-    // ESP32通訊區：I2=設備狀態、J2=重置狀態、I4=馬達指令狀態
-    dliSheet.getRange("I2").setValue(cleanStatus);
+        dliSheet.getRange("I2").setValue(cleanStatus);
+        dliSheet.getRange("I5").setValue(cleanFwVersion || "(未回報)"); // 韌體版本
+        // 🆕 I6是靜態標題，直接在試算表手動打字即可，GAS不需要每次覆寫
+    }
 
     var updatedRows = totalDataSheet.getLastRow();
     var maxRowsAllowed = 14401;
@@ -211,7 +212,7 @@ function doGet(e) {
     }
     SCRIPT_PROPS.setProperty("LAST_DATA_TIME", nowTime.toString());
 
-    if (updatedRows >= 15) {
+    if (updatedRows >= 15 && !isBackfill) {
         var v = totalDataSheet.getRange("C2:E14").getValues();
         var temp_now = (Number(v[0][0]) + Number(v[1][0]) + Number(v[2][0])) / 3;
         var hum_now = (Number(v[0][1]) + Number(v[1][1]) + Number(v[2][1])) / 3;
@@ -237,17 +238,65 @@ function doGet(e) {
     }
 
     var returnCmd = "OK";
-    var resetFlag = dliSheet.getRange("J2").getValue();
-    var motorFlag = dliSheet.getRange("I4").getValue();
 
-    if (resetFlag === "RESET_PENDING" || resetFlag === "YES") {
-        dliSheet.getRange("J2").setValue("NORMAL");
-        SCRIPT_PROPS.setProperty("LAST_RESET_TIME", nowTime.toString());
-        returnCmd = "CMD_RESET";
-    }
-    else if (motorFlag !== "" && motorFlag !== "NORMAL") {
-        dliSheet.getRange("I4").setValue("NORMAL");
-        returnCmd = motorFlag;
+    if (!isBackfill) {
+        var resetFlag = dliSheet.getRange("J2").getValue();
+        var motorFlag = dliSheet.getRange("I4").getValue();
+
+        // 🆕 OTA四階段狀態機：閒置(-) → 已排程(🔄) → 下載中(⏳,含開始時間) → 完成(✅,下次打卡自動清回-) / 逾時失敗(❌,停止自動重試)
+        var otaTargetVersion = SCRIPT_PROPS.getProperty("OTA_TARGET_VERSION") || "";
+        var otaStatus = String(dliSheet.getRange("I7").getValue() || "");
+        var otaNeeded = false;
+        var versionMismatch = (otaTargetVersion !== "" && cleanFwVersion !== "" && cleanFwVersion !== otaTargetVersion);
+
+        if (otaStatus.indexOf("⏳") === 0) {
+            // 目前正在下載中：檢查這次打卡的版本是否已吻合(代表上次OTA成功了)
+            if (!versionMismatch) {
+                dliSheet.getRange("I7").setValue("✅ 更新完成");
+                SCRIPT_PROPS.deleteProperty("OTA_START_TIME");
+            } else {
+                var otaStartStr = SCRIPT_PROPS.getProperty("OTA_START_TIME");
+                var otaStart = otaStartStr ? parseInt(otaStartStr) : nowTime;
+                if (nowTime - otaStart > OTA_TIMEOUT_MS) {
+                    // 逾時仍未成功，判定失敗，停止自動重試，避免無限鬼打牆
+                    dliSheet.getRange("I7").setValue("❌ 更新逾時失敗，請重新觸發(LINE:更新韌體)");
+                    SCRIPT_PROPS.deleteProperty("OTA_START_TIME");
+                } else {
+                    // 還在等待窗內，繼續嘗試
+                    otaNeeded = true;
+                }
+            }
+        } else if (otaStatus.indexOf("🔄") === 0) {
+            // LINE剛排程，這次打卡開始執行，記錄開始時間供逾時判斷
+            otaNeeded = true;
+            SCRIPT_PROPS.setProperty("OTA_START_TIME", nowTime.toString());
+            dliSheet.getRange("I7").setValue("⏳ 正在下載與更新韌體...");
+        } else if (versionMismatch) {
+            // 沒有手動觸發，但版本比對不同(例如直接改了OTA_TARGET_VERSION)，一樣視為需要更新
+            otaNeeded = true;
+            SCRIPT_PROPS.setProperty("OTA_START_TIME", nowTime.toString());
+            dliSheet.getRange("I7").setValue("⏳ 正在下載與更新韌體...");
+        } else if (otaStatus.indexOf("✅") === 0) {
+            // 顯示過一次「完成」後，這次打卡自動清回閒置
+            dliSheet.getRange("I7").setValue("-");
+        } else if (otaStatus === "") {
+            // 從未初始化過，補上閒置狀態
+            dliSheet.getRange("I7").setValue("-");
+        }
+        // 其餘情況(閒置"-"或"❌失敗"且版本已吻合)：otaNeeded維持false，不會自動重試
+
+        if (resetFlag === "RESET_PENDING" || resetFlag === "YES") {
+            dliSheet.getRange("J2").setValue("NORMAL");
+            SCRIPT_PROPS.setProperty("LAST_RESET_TIME", nowTime.toString());
+            returnCmd = "CMD_RESET";
+        }
+        else if (otaNeeded) {
+            returnCmd = "CMD_OTA:" + otaTargetVersion;
+        }
+        else if (motorFlag !== "" && motorFlag !== "NORMAL") {
+            dliSheet.getRange("I4").setValue("NORMAL");
+            returnCmd = motorFlag;
+        }
     }
 
     return ContentService.createTextOutput(returnCmd);
@@ -382,7 +431,7 @@ function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
     }
     var archiveSS = SpreadsheetApp.openById(archiveId);
 
-    var lastCol = Math.max(sourceSheet.getLastColumn(), 20); // 確保含A~T
+    var lastCol = Math.max(sourceSheet.getLastColumn(), 20);
     var dataToArchive = sourceSheet.getRange(startRow, 1, numRows, lastCol).getValues();
 
     var rowsByMonth = {};
@@ -483,10 +532,6 @@ function archiveDailyDLI() {
     console.log("已成功將 " + todayStr + " 的 B~E 欄鎖定為「純數字」歷史紀錄！");
 }
 
-// ======================== 🆕 每日統計表：系統直接寫入,不用公式 ========================
-
-// 🔧 修正用：把各種可能出現的日期字串/日期物件，統一 normalize 成 yyyy/MM/dd（補零）格式，
-// 避免「2026/7/16」與「2026/07/16」被判定為不同日期，導致明明已有列卻又新增一列的問題。
 function normalizeDateStr_(v) {
     if (v instanceof Date) return Utilities.formatDate(v, "GMT+8", "yyyy/MM/dd");
     var s = (v || "").toString().trim().replace(/-/g, "/");
@@ -547,7 +592,6 @@ function computeAndWriteDailyStats_(todayStr, todayRowsInput) {
     var sheet = ss.getSheetByName("每日統計表");
     if (!sheet) { console.error("找不到「每日統計表」分頁！"); return; }
 
-    // 傳進來的 todayStr 也一併 normalize，確保跟表內比對用的是同一種格式
     todayStr = normalizeDateStr_(todayStr);
 
     var todayRows = todayRowsInput.slice().reverse();
@@ -619,8 +663,6 @@ function computeAndWriteDailyStats_(todayStr, todayRowsInput) {
     var disconnectRate  = Math.min(100, Math.round((disconnectCount / 1440) * 1000) / 10) + "%";
     var sensorErrorRate = Math.min(100, Math.round((sensorErrorCount / 1440) * 1000) / 10) + "%";
 
-    // 🔧 修正：比對前先把表內既有日期 normalize，避免補零/不補零格式不一致
-    //    導致同一天被判定成不同日期，進而重複新增列而不是覆蓋既有列。
     var lastRowInSheet = sheet.getLastRow();
     var targetRow = -1;
     if (lastRowInSheet >= 2) {
@@ -704,6 +746,10 @@ function doPost(e) {
             else if (userMessage === "洗盆功能") {
                 replyButtonMenu(replyToken, "洗盆", "請選擇洗盆目標", "🚿 請點擊下方按鈕，選擇要【洗盆】的盆栽：");
             }
+            else if (userMessage === "更新韌體") {
+                dliSheet.getRange("I7").setValue("🔄 已排程更新 (等待ESP32打卡)");
+                replyText(replyToken, "🔄 已下達強制OTA更新指令！\nESP32將於下次打卡時開始更新，完成後會自動重啟。");
+            }
             else if (userMessage.indexOf("澆水 ") === 0 || userMessage.indexOf("洗盆 ") === 0) {
                 var action = userMessage.split(" ")[0];
                 var plant = userMessage.split(" ")[1];
@@ -722,7 +768,16 @@ function doPost(e) {
                 }
             }
             else {
-                replyText(replyToken, "🤔 系統聽不懂。請點選圖文選單或輸入：看狀態、看圖表、澆水功能、洗盆功能。");
+                // 🆕 補齊所有實際支援的指令，避免使用者猜不到還有哪些可用
+                replyText(replyToken,
+                    "🤔 系統聽不懂這句話。可用指令：\n" +
+                    "• 看狀態\n" +
+                    "• 看圖表\n" +
+                    "• 澆水功能 / 洗盆功能（會跳出選單按鈕）\n" +
+                    "• 澆水 茉莉 / 澆水 桂花 / 澆水 朝天椒\n" +
+                    "• 洗盆 茉莉 / 洗盆 桂花 / 洗盆 朝天椒\n" +
+                    "• 更新韌體（強制觸發OTA）"
+                );
             }
         }
     }
@@ -1241,20 +1296,11 @@ function updateWeatherSnapshot_1Week() {
 // 🧰 手動 / 一次性工具函式（不會被觸發器自動呼叫，需要時才手動執行一次）
 // ============================================================
 
-// 【觸發ESP32遠端重置】
-// 設定方式：不用設定，隨時要重置ESP32時，在此編輯器函式選單選 triggerESP32Reset，點「執行」即可。
-// 執行後會把「即時訊息」分頁 J2 設為 RESET_PENDING，等 ESP32 下次打卡(doGet)時會被清成 NORMAL、
-// 並回傳 CMD_RESET 指令給硬體，讓 ESP32 收到後自行重啟。
 function triggerESP32Reset() {
     SpreadsheetApp.getActiveSpreadsheet().getSheetByName("即時訊息").getRange("J2").setValue("RESET_PENDING");
     SpreadsheetApp.getUi().alert("🚀【指令已下達】\n遠端重置訊號已就緒！");
 }
 
-// 【建立/重建 CWA 天氣預報快照觸發器】
-// 設定方式：只有在「觸發器」頁面被手動刪除、或第一次要啟用天氣快照功能時，才需要手動執行一次
-// setupWeatherTriggers。執行前記得先在「專案設定→指令碼屬性」設好 CWA_API_KEY，否則抓取會失敗。
-// 執行後會自動建立：3小時預報每3小時觸發一次(00/03/06.../21)、1週預報每12小時觸發一次(06/18)，
-// 執行前會先清掉舊的同名觸發器，避免重複建立、跑好幾份。
 function setupWeatherTriggers() {
   ScriptApp.getProjectTriggers().forEach(function (trigger) {
     var fn = trigger.getHandlerFunction();
@@ -1280,12 +1326,6 @@ function setupWeatherTriggers() {
   Logger.log('氣象預報觸發器建立完成:3天預報對齊00/03/06.../21,1週預報對齊06/18(各延遲5分鐘緩衝)');
 }
 
-// 【回填每日統計表全部歷史】
-// 設定方式：不用改任何參數。當「資訊總表」裡有任何日期在「每日統計表」還沒有對應列時
-// (例如新裝了感測器補進舊資料、或每日統計表分頁重建過)，執行一次 backfillDailyStatsTableHistory，
-// 會自動掃描資訊總表現存的「所有」日期，逐日呼叫 archiveDailyStatsTableForDate_ 補算，
-// 不用像 archiveDailyStatsTableForDate_ 那樣要自己一天一天輸入日期字串下參數。
-// 執行完可以在「執行記錄」看到掃到幾個日期、逐一補算完成的訊息。
 function backfillDailyStatsTableHistory() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var source = ss.getSheetByName("資訊總表");
@@ -1324,10 +1364,9 @@ function handleAIExport_(e) {
     var result;
 
     if (scope === "all") {
-        // 一次掃描所有分頁，公式+值，大表自動限制列數避免逾時/資料爆量
         var sheets = ss.getSheets();
         var allData = {};
-        var MAX_ROWS_PER_SHEET = 30; // 大表只抓最新30列，小表本來就不到30列會整份給
+        var MAX_ROWS_PER_SHEET = 30;
 
         for (var i = 0; i < sheets.length; i++) {
             var sh = sheets[i];
@@ -1351,7 +1390,6 @@ function handleAIExport_(e) {
         result = { spreadsheetName: ss.getName(), sheets: allData };
 
     } else if (!sheetName) {
-        // 原本的分頁分布總覽邏輯 (維持不變)
         var sheets = ss.getSheets();
         var sheetsInfo = [];
         for (var i = 0; i < sheets.length; i++) {
@@ -1365,7 +1403,6 @@ function handleAIExport_(e) {
         result = { spreadsheetName: ss.getName(), sheetCount: sheets.length, sheets: sheetsInfo };
 
     } else {
-        // 原本的單一分頁邏輯 (維持不變)
         var sheet = ss.getSheetByName(sheetName);
         if (!sheet) {
             result = { error: "找不到分頁：" + sheetName };
@@ -1385,26 +1422,17 @@ function handleAIExport_(e) {
 // ============================================================
 // 🌤️ 仰角修正曲線統計模組（2026/07新增）
 // ============================================================
-// 目的：累積「資訊總表」裡裸版(T欄)/罩版(P欄)比值，依仰角(Q欄)分桶，
-//       只採用可信度(R欄)≥90的樣本，持續收斂出穩定的仰角修正曲線。
-// 設計：累積式更新，只處理「上次統計過的最後一列」之後的新資料，
-//       不用每次全表重算，避免「資訊總表」13000+列造成逾時。
-
 const ELEV_CURVE_SHEET_NAME = '仰角修正曲線';
-const ELEV_CURVE_BIN_SIZE = 2; // 每桶涵蓋的仰角度數
+const ELEV_CURVE_BIN_SIZE = 2;
 const ELEV_CURVE_MIN_CONFIDENCE = 90;
 
-// 🆕 已知的感測器飽和上限常數，用來過濾封頂假訊號：
-// 0x23(罩版)全程都是MTreg=69，理論飽和值恆定為54612.5；
-// 0x5C(裸板)分兩個時期：改動前MTreg=69、改動後MTreg=31(2026/07/19起)，兩種飽和值都要排除。
-// ⚠️ 之後如果0x5C再換模組或改MTreg，記得回來更新這個陣列。
 const SATURATION_VALUES = [54612.5, 121556.86];
-const SATURATION_TOLERANCE = 1.0; // 誤差容許範圍(浮點/測量微幅波動)
+const SATURATION_TOLERANCE = 1.0;
 
 function isSaturatedOrInvalid_(value) {
   if (value === '' || value === null || isNaN(value)) return true;
   var v = Number(value);
-  if (v <= 0) return true; // 讀0但另一顆有值,判定感測器異常/掉線,不是真實暗場
+  if (v <= 0) return true;
   for (var i = 0; i < SATURATION_VALUES.length; i++) {
     if (Math.abs(v - SATURATION_VALUES[i]) < SATURATION_TOLERANCE) return true;
   }
@@ -1422,7 +1450,6 @@ function getOrCreateElevCurveSheet_(ss) {
   return sheet;
 }
 
-// 讀取既有桶次統計（樣本數、比值總和、平方和），回傳 map: binIndex -> {count, sum, sumSq}
 function loadExistingBins_(sheet) {
   var lastRow = sheet.getLastRow();
   var bins = {};
@@ -1462,27 +1489,24 @@ function updateElevationCorrectionCurve() {
   }
   var scanRows = Math.min(newRowCount, 5000);
 
-  // P欄(16)~T欄(20)維持原本欄位, 新增V欄(22)=裸版位置標記
   var data = source.getRange(2, 16, scanRows, 7).getValues();
-  // data[i]: [0]P罩版 [1]Q仰角 [2]R可信度 [3]S仰角修正測試值 [4]T裸版 [5]U光罩位置 [6]V裸版位置
 
-  // 🆕 狀態延續：由舊到新順推裸版位置標記，銜接上次批次結尾記錄的狀態
   var carryInState = SCRIPT_PROPS.getProperty('BARE_LOCATION_STATE') || '';
-  var chronological = data.slice().reverse(); // 反轉成「舊→新」時間順序
+  var chronological = data.slice().reverse();
   var locationStates = [];
   var currentState = carryInState;
   for (var c = 0; c < chronological.length; c++) {
-    var marker = chronological[c][6]; // V欄
+    var marker = chronological[c][6];
     if (marker && marker.toString().trim() !== '') {
       currentState = marker.toString().trim();
     }
     locationStates.push(currentState);
   }
-  locationStates.reverse(); // 轉回跟data相同的「新→舊」順序，方便對應index
+  locationStates.reverse();
 
   var bins = loadExistingBins_(curveSheet);
   var skippedSaturated = 0;
-  var skippedShaded = 0; // 🆕 統計本次因遮蔭排除的筆數
+  var skippedShaded = 0;
 
   for (var i = 0; i < data.length; i++) {
     var covered = data[i][0];
@@ -1494,7 +1518,6 @@ function updateElevationCorrectionCurve() {
     if (confidence === '' || confidence === null || isNaN(confidence)) continue;
     if (Number(confidence) < ELEV_CURVE_MIN_CONFIDENCE) continue;
 
-    // 🆕 排除裸板當時處於「遮陰」狀態的樣本(比對關鍵字,不要求完全等於,避免你手動輸入用詞略有差異)
     var stateStr = locationStates[i] || '';
     if (stateStr.indexOf('遮陰') !== -1 || stateStr.indexOf('遮蔭') !== -1) {
       skippedShaded++;
@@ -1537,7 +1560,6 @@ function updateElevationCorrectionCurve() {
     curveSheet.getRange(2, 1, outputRows.length, 6).setValues(outputRows);
   }
 
-  // 🆕 記錄這批次「最舊那一列」延續下來的狀態，供下次執行(更早的資料)銜接判斷
   if (chronological.length > 0) {
     SCRIPT_PROPS.setProperty('BARE_LOCATION_STATE', chronological[0][6] ? chronological[0][6].toString().trim() : currentState);
   }
@@ -1546,9 +1568,6 @@ function updateElevationCorrectionCurve() {
 
   console.log('仰角修正曲線更新完成，本次新增處理 ' + scanRows + ' 列(過濾封頂/異常 ' + skippedSaturated + ' 筆、過濾遮蔭 ' + skippedShaded + ' 筆)，累積 ' + outputRows.length + ' 個仰角區間，目前進度 ' + (lastProcessedRow + scanRows) + '/' + totalRows);
 }
-// 【手動工具】重置累積統計，重新從頭掃描全部歷史資料
-// 使用時機：改了ELEV_CURVE_BIN_SIZE、ELEV_CURVE_MIN_CONFIDENCE、SATURATION_VALUES等參數後，
-// 舊桶次統計已經不適用(可能混了污染樣本)，需要執行這個清空重來。
 function resetElevationCorrectionCurve() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var curveSheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
@@ -1557,6 +1576,10 @@ function resetElevationCorrectionCurve() {
     if (lastRow > 1) curveSheet.getRange(2, 1, lastRow - 1, 6).clearContent();
   }
   SCRIPT_PROPS.deleteProperty('ELEV_CURVE_LAST_ROW');
-  SCRIPT_PROPS.deleteProperty('BARE_LOCATION_STATE'); // 🆕 一併清掉裸板位置延續狀態，避免殘留舊狀態影響重跑結果
+  SCRIPT_PROPS.deleteProperty('BARE_LOCATION_STATE');
   console.log('仰角修正曲線統計已重置，下次執行updateElevationCorrectionCurve將從頭掃描全部歷史資料');
+}
+function setOtaTargetVersion() {
+    SCRIPT_PROPS.setProperty("OTA_TARGET_VERSION", "ESP32072002"); // 🔧 改成你這次要推送的版本號
+    SpreadsheetApp.getUi().alert("✅ OTA目標版本已設定為：ESP32072002");
 }
