@@ -122,9 +122,9 @@ function doGet(e) {
         rawLight2 = cleanLight2;
     }
 
-    if (cleanSoilJ === 100) cleanSoilJ = "";
-    if (cleanSoilO === 100) cleanSoilO = "";
-    if (cleanSoilP === 100) cleanSoilP = "";
+    if (cleanSoilJ > 100.5) cleanSoilJ = "";
+    if (cleanSoilO > 100.5) cleanSoilO = "";
+    if (cleanSoilP > 100.5) cleanSoilP = "";
 
     var storedJ = SCRIPT_PROPS.getProperty("BASE_J");
     var storedO = SCRIPT_PROPS.getProperty("BASE_O");
@@ -134,10 +134,10 @@ function doGet(e) {
     var baseP = (storedP !== null) ? Number(storedP) : (cleanSoilP === "" ? 0 : cleanSoilP);
 
     var lastResetDay = SCRIPT_PROPS.getProperty("LAST_RESET_DAY") || "";
-    var currentHour = now.getHours();
     var currentRows = totalDataSheet.getLastRow();
 
-    if (currentHour >= 6 && lastResetDay !== dateStr) {
+    // 🔧 修正：改為「跨日就重置」，不再等到6點後才重置(原本 currentHour>=6 的判斷已移除)
+    if (lastResetDay !== dateStr) {
         if (cleanSoilJ !== "" && cleanSoilO !== "" && cleanSoilP !== "") {
             baseJ = cleanSoilJ; baseO = cleanSoilO; baseP = cleanSoilP;
             SCRIPT_PROPS.setProperties({
@@ -195,14 +195,28 @@ function doGet(e) {
     var purgeRowCount = purgeDays * 1440;
 
     if (updatedRows > maxRowsAllowed) {
-       var deleteStartRow = updatedRows - purgeRowCount + 1;
-    try {
-        backupRowsBeforePurge_(totalDataSheet, deleteStartRow, purgeRowCount);
-    } catch (err) {
-        console.error("封存失敗，仍繼續刪除以避免資料表無限增長: " + err.message);
+        var deleteStartRow = updatedRows - purgeRowCount + 1;
+        // 🔧 修正：備份失敗時「不能刪除」，並且要傳 LINE 通知失敗原因，
+        // 直到備份成功前，每次打卡都會重試備份+刪除，資料只會越堆越多、不會遺失。
+        try {
+            backupRowsBeforePurge_(totalDataSheet, deleteStartRow, purgeRowCount);
+            totalDataSheet.deleteRows(deleteStartRow, purgeRowCount);
+            console.log("封存成功，已刪除 " + purgeRowCount + " 列舊資料（保留最新約7天）");
+
+            // 🔧 修正：刪除舊資料後，「仰角修正曲線」模組用來記錄進度的水位(ELEV_CURVE_LAST_ROW)
+            // 是用「資訊總表」的總列數在累加，資訊總表列數減少後水位沒有跟著減少的話，
+            // 之後會誤判成「沒有新資料」而永久停止處理。這裡刪除多少列就把水位同步扣掉多少，
+            // 確保之後還能正確判斷「有多少新資料」。
+            var elevWatermarkStr = SCRIPT_PROPS.getProperty('ELEV_CURVE_LAST_ROW');
+            if (elevWatermarkStr) {
+                var elevWatermark = Number(elevWatermarkStr) - purgeRowCount;
+                SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', Math.max(0, elevWatermark).toString());
+            }
+        } catch (err) {
+            console.error("封存失敗，本次略過刪除以避免資料未備份就被清除：" + err.message);
+            notifyBackupFailure_(err.message);
+        }
     }
-    totalDataSheet.deleteRows(deleteStartRow, purgeRowCount);
-}
     var lastDataTimeStr = SCRIPT_PROPS.getProperty("LAST_DATA_TIME");
     if (lastDataTimeStr) {
         var lastDataTime = parseInt(lastDataTimeStr);
@@ -426,12 +440,18 @@ function checkEspStatusAndInsertBlank() {
 function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
     var archiveId = SCRIPT_PROPS.getProperty("ARCHIVE_FILE_ID");
     if (!archiveId) {
-        console.error("尚未設定 ARCHIVE_FILE_ID，略過封存（請先執行 setupArchiveFile 建立封存檔）");
-        return;
+        // 🔧 修正：找不到封存檔設定時，改成拋出例外，讓呼叫端(doGet)知道備份失敗、不能刪除資料
+        throw new Error("尚未設定 ARCHIVE_FILE_ID，請先執行 setupArchiveFile 建立封存檔");
     }
-    var archiveSS = SpreadsheetApp.openById(archiveId);
 
-    var lastCol = Math.max(sourceSheet.getLastColumn(), 20);
+    var archiveSS;
+    try {
+        archiveSS = SpreadsheetApp.openById(archiveId);
+    } catch (err) {
+        throw new Error("無法開啟封存檔試算表(ID: " + archiveId + ")：" + err.message);
+    }
+
+    var lastCol = Math.max(sourceSheet.getLastColumn(), 23);
     var dataToArchive = sourceSheet.getRange(startRow, 1, numRows, lastCol).getValues();
 
     var rowsByMonth = {};
@@ -451,10 +471,13 @@ function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
         rowsByMonth[monthKey].push(row);
     }
 
+    // 🔧 修正：headers 從 20 欄補齊到跟「資訊總表」實際一致的 23 欄，
+    // 原本只有 20 欄會讓「光罩位置」「裸版位置」「即時天氣觀測」這 3 欄在封存時被截斷遺失。
     var headers = ["日期", "時間", "溫度", "濕度", "氣壓", "校正光照", "PPFD",
                     "土壤J", "土壤O", "土壤P", "狀態", "累積J", "累積O", "累積P",
                     "日期時間(輔助,無秒)", "原始光照(未校正)", "太陽仰角",
-                    "光照可信度", "仰角修正測試值", "光感器2原始值"];
+                    "光照可信度", "仰角修正測試值", "光感器2原始值",
+                    "光罩位置", "裸版位置", "即時天氣觀測"];
 
     for (var monthKey in rowsByMonth) {
         var sheetName = "ESP32備份" + monthKey;
@@ -471,6 +494,7 @@ function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
     }
 
     console.log("已封存 " + dataToArchive.length + " 列到封存檔（依月份分頁），刪除前備份完成");
+    return dataToArchive.length;
 }
 
 function padRowsToLength_(rows, targetLength) {
@@ -480,6 +504,21 @@ function padRowsToLength_(rows, targetLength) {
         return padded;
     });
 }
+
+// 🆕 備份失敗時的 LINE 通知（加上節流，避免每分鐘打卡都連續洗版）
+function notifyBackupFailure_(reason) {
+    var THROTTLE_MS = 30 * 60 * 1000; // 30分鐘內只通知一次
+    var lastNotifyStr = SCRIPT_PROPS.getProperty("LAST_BACKUP_FAIL_NOTIFY");
+    var nowTime = new Date().getTime();
+    if (lastNotifyStr && (nowTime - parseInt(lastNotifyStr) < THROTTLE_MS)) {
+        return;
+    }
+    var msg = "🚨【封存失敗】\n資料已達刪除閾值，但封存到備份檔失敗，本次已自動略過刪除、資料保留不變。\n\n失敗原因：\n" + reason +
+        "\n\n請盡快檢查 ARCHIVE_FILE_ID 設定或封存檔權限，在修好之前資訊總表會持續增長但不會遺失資料。";
+    sendLinePushMessage(msg);
+    SCRIPT_PROPS.setProperty("LAST_BACKUP_FAIL_NOTIFY", nowTime.toString());
+}
+
 // ======================== 🛡️ 核心 4 函式：每日 DLI 歷史紀錄結算與鎖定引擎 ========================
 function archiveDailyDLI() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1560,8 +1599,11 @@ function updateElevationCorrectionCurve() {
     curveSheet.getRange(2, 1, outputRows.length, 6).setValues(outputRows);
   }
 
+  // 🔧 修正：原本存的是 chronological[0][6]（這批資料裡「最舊」一列的原始標記值，
+  // 常常是空字串），應該存這批資料處理完之後、代表「最新狀態」的 currentState，
+  // 下次執行時才會從正確的地方接續判斷遮陰/直曬。
   if (chronological.length > 0) {
-    SCRIPT_PROPS.setProperty('BARE_LOCATION_STATE', chronological[0][6] ? chronological[0][6].toString().trim() : currentState);
+    SCRIPT_PROPS.setProperty('BARE_LOCATION_STATE', currentState);
   }
 
   SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', (lastProcessedRow + scanRows).toString());
