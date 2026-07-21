@@ -56,7 +56,9 @@ function doGet(e) {
         console.warn("拒絕未授權的存取請求！");
         return ContentService.createTextOutput("UNAUTHORIZED");
     }
-
+    if (isBackfill) {
+        console.log('📥 收到回補資料，原始時間戳記：' + timeStr + '，緩衝區編號ts=' + e.parameter.ts);
+    }
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var totalDataSheet = ss.getSheetByName("資訊總表");
     var dliSheet = ss.getSheetByName("即時訊息");
@@ -107,8 +109,10 @@ function doGet(e) {
         correctedLight = Math.round(cleanLight * LIGHT_CORRECTION_FACTOR * 10) / 10;
         calcPPFD = (correctedLight * 0.0185).toFixed(1);
 
-        var elevFactor = getElevationAdjustmentFactor_(pos.elevation, pos.azimuth);
-        elevAdjustedLight = Math.round(cleanLight * LIGHT_CORRECTION_FACTOR * elevFactor * 10) / 10;
+        var lightType = getLightType_(pos.elevation, pos.azimuth);
+        var period = pos.hourAngle < 0 ? 'AM' : 'PM';
+        var ratio = (lightType === 'none') ? null : lookupElevationRatio_(pos.elevation, period);
+        elevAdjustedLight = (ratio !== null) ? Math.round(cleanLight * ratio * 10) / 10 : '';
 
         lightConfidence = calculateLightConfidence_(solarElevation);
     }
@@ -179,6 +183,13 @@ function doGet(e) {
 
     totalDataSheet.getRange(2, 20).setValue(rawLight2);
 
+    // 🆕 如果這筆是離線回補的歷史資料，且它所屬的那個小時「已經」被封存過，
+    // 就立刻重算覆蓋掉舊的（可能偏低的）統計，避免回補資料進來了但統計數字沒跟著更新。
+    if (isBackfill) {
+        var backfillBucketTime = new Date(recordDate.getFullYear(), recordDate.getMonth(), recordDate.getDate(), recordDate.getHours());
+        recomputeHourlyBucket_(backfillBucketTime);
+    }
+
     if (!isBackfill) {
         dliSheet.getRange(2, 1, 1, 5).setValues([[dateStr, timeStr, cleanTemp, cleanHum, cleanPres]]);
         dliSheet.getRange(2, 6, 1, 3).setValues([[cleanSoilJ, cleanSoilO, cleanSoilP]]);
@@ -225,6 +236,7 @@ function doGet(e) {
         }
     }
     SCRIPT_PROPS.setProperty("LAST_DATA_TIME", nowTime.toString());
+    SCRIPT_PROPS.deleteProperty("LAST_BLANK_FILL_TIME"); // 🆕 恢復連線後重置回補進度，下次斷線視為全新一輪空窗
 
     if (updatedRows >= 15 && !isBackfill) {
         var v = totalDataSheet.getRange("C2:E14").getValues();
@@ -378,17 +390,21 @@ function calculateSolarPosition_(date, lat, lon) {
     cosAz = Math.max(-1, Math.min(1, cosAz));
     var azRaw = Math.acos(cosAz) / rad;
     var azimuth = (hourAngle > 0) ? (360 - azRaw) : azRaw;
-    return { elevation: elevation, azimuth: azimuth };
+    return { elevation: elevation, azimuth: azimuth, hourAngle: hourAngle };  // 🆕 多回傳 hourAngle
 }
 
 var BALCONY_AZ_MIN = 58;
 var BALCONY_AZ_MAX = 233;
-var BALCONY_EL_MIN = 20.4;
-var BALCONY_EL_MAX = 84;
+var BALCONY_EL_MIN = 10.7;         // 🆕 日出後直射光下限（觀測值，取代舊的20.4）
+var BALCONY_EL_DIRECT_MAX = 87;    // 🆕 直射轉散射的固定門檻（觀測值，取代舊的84）
 
-function isBalconyLit_(elevation, azimuth) {
-    return (azimuth >= BALCONY_AZ_MIN && azimuth <= BALCONY_AZ_MAX) &&
-           (elevation >= BALCONY_EL_MIN && elevation <= BALCONY_EL_MAX);
+// 🆕 取代 isBalconyLit_：回傳 'direct'（直射）/ 'diffuse'（散射）/ 'none'（方位角外或未日出，無光）
+function getLightType_(elevation, azimuth) {
+    var inAzimuthWindow = (azimuth >= BALCONY_AZ_MIN && azimuth <= BALCONY_AZ_MAX);
+    if (!inAzimuthWindow) return 'none';           // 方位角決定「有沒有光」的時間窗
+    if (elevation < BALCONY_EL_MIN) return 'none'; // 未達日出仰角
+    if (elevation <= BALCONY_EL_DIRECT_MAX) return 'direct';
+    return 'diffuse';                              // >87° 固定判定為散射，直到日落
 }
 
 function estimateShadowTransitionTime_(dateStr, lat, lon) {
@@ -413,7 +429,58 @@ function estimateShadowTransitionTime_(dateStr, lat, lon) {
     }
     return transitionTime;
 }
+// ======================== 🔄 資料驅動仰角修正公式（滾動式自動校正）========================
+var ELEV_RATIO_TABLE_PROP = 'ELEV_RATIO_TABLE';
+var ELEV_RATIO_MIN_SAMPLES = 5; // 樣本數低於此門檻的區間視為不可靠，查表時跳過改找鄰近區間
 
+function recalibrateElevationCorrectionFormula() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var curveSheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
+  if (!curveSheet) { console.error('找不到仰角修正曲線分頁，無法校正公式'); return; }
+
+  var lastRow = curveSheet.getLastRow();
+  if (lastRow < 2) { console.log('仰角修正曲線尚無資料，略過本次校正'); return; }
+
+  var data = curveSheet.getRange(2, 1, lastRow - 1, 7).getValues();
+  var table = { AM: {}, PM: {} };
+
+  for (var i = 0; i < data.length; i++) {
+    var binLow = data[i][0];
+    var period = data[i][2];
+    var count = Number(data[i][3]);
+    var mean = Number(data[i][5]);
+    if (!period || count < ELEV_RATIO_MIN_SAMPLES || isNaN(mean)) continue;
+    var binIndex = Math.floor(binLow / ELEV_CURVE_BIN_SIZE);
+    table[period][binIndex] = mean;
+  }
+
+  SCRIPT_PROPS.setProperty(ELEV_RATIO_TABLE_PROP, JSON.stringify(table));
+  SCRIPT_PROPS.setProperty('ELEV_RATIO_TABLE_UPDATED', new Date().toISOString());
+  console.log('仰角修正公式已校正，AM區間數=' + Object.keys(table.AM).length
+    + '，PM區間數=' + Object.keys(table.PM).length);
+}
+
+// 查表：優先找同時段最近的區間，找不到才跨到對向時段
+function lookupElevationRatio_(elevation, period) {
+  var tableStr = SCRIPT_PROPS.getProperty(ELEV_RATIO_TABLE_PROP);
+  if (!tableStr) return null;
+  var table;
+  try { table = JSON.parse(tableStr); } catch (err) { return null; }
+
+  var binIndex = Math.floor(elevation / ELEV_CURVE_BIN_SIZE);
+  var primary = table[period] || {};
+  var fallback = (period === 'AM') ? (table['PM'] || {}) : (table['AM'] || {});
+
+  for (var d = 0; d <= 5; d++) {
+    if (primary[binIndex + d] !== undefined) return primary[binIndex + d];
+    if (primary[binIndex - d] !== undefined) return primary[binIndex - d];
+  }
+  for (var d2 = 0; d2 <= 5; d2++) {
+    if (fallback[binIndex + d2] !== undefined) return fallback[binIndex + d2];
+    if (fallback[binIndex - d2] !== undefined) return fallback[binIndex - d2];
+  }
+  return null; // 完全查不到（通常是剛部署、資料還太少）
+}
 // ======================== 🛡️ 核心 3 函式：資安過濾 ========================
 function sanitizeInput(val, isNumber) {
     if (val === undefined || val === null) return isNumber ? 0 : "";
@@ -424,6 +491,9 @@ function sanitizeInput(val, isNumber) {
 }
 
 // ======================== 🛡️ 核心 1 函式：雲端看門狗 ========================
+// 🆕 改為「逐分鐘回補」：每次觸發時，把上次已補到的分鐘 到 現在之間所有漏掉的分鐘
+// 都各補一列「斷線」，而不是只補「現在」這一列，這樣就算觸發器頻率只有5分鐘一次，
+// 補齊後的「每小時統計表」也能還原出接近真實的逐分鐘斷線比例。
 function checkEspStatusAndInsertBlank() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var dataSheet = ss.getSheetByName("資訊總表");
@@ -433,14 +503,43 @@ function checkEspStatusAndInsertBlank() {
     var lastDataTimeStr = SCRIPT_PROPS.getProperty("LAST_DATA_TIME");
     if (!lastDataTimeStr) return;
 
-    var diff = nowTime - parseInt(lastDataTimeStr);
-    if (diff > 120000 && diff < 86400000) {
-        var now = new Date();
-        var dateStr = Utilities.formatDate(now, "GMT+8", "yyyy/MM/dd");
-        var timeStr = Utilities.formatDate(now, "GMT+8", "HH:mm:ss");
-        dataSheet.insertRowBefore(2);
-        dataSheet.getRange(2, 1, 1, 14).setValues([[dateStr, timeStr, "", "", "", "", "", "", "", "", "斷線", "", "", ""]]);
+    var lastDataTime = parseInt(lastDataTimeStr);
+    var diff = nowTime - lastDataTime;
+    if (diff <= 120000 || diff >= 86400000) return;
+
+    var lastFillStr = SCRIPT_PROPS.getProperty("LAST_BLANK_FILL_TIME");
+    var fillFrom = lastFillStr ? parseInt(lastFillStr) : lastDataTime;
+
+    // 從fillFrom所在分鐘的下一分鐘開始補，補到「現在」所在分鐘的前一分鐘為止
+    // (當下這分鐘還沒走完，不補，避免跟稍後真正的正常打卡或斷線列衝突)
+    var startMinute = Math.floor(fillFrom / 60000) + 1;
+    var endMinute = Math.floor(nowTime / 60000);
+    var minutesToFill = endMinute - startMinute;
+    if (minutesToFill <= 0) return;
+
+    var MAX_FILL_PER_RUN = 60; // 單次最多補60列，避免長時間斷線一次補太多拖慢執行
+    var fillCount = Math.min(minutesToFill, MAX_FILL_PER_RUN);
+
+    // 資訊總表是新到舊排序，row2是最新，所以要從「最新的待補分鐘」往「最舊的待補分鐘」組陣列
+    var rows = [];
+    for (var m = fillCount - 1; m >= 0; m--) {
+        var minuteEpochMs = (startMinute + m) * 60000;
+        var t = new Date(minuteEpochMs);
+        var dateStr = Utilities.formatDate(t, "GMT+8", "yyyy/MM/dd");
+        var timeStr = Utilities.formatDate(t, "GMT+8", "HH:mm:00");
+        rows.push([dateStr, timeStr, "", "", "", "", "", "", "", "", "斷線", "", "", ""]);
     }
+
+    dataSheet.insertRowsBefore(2, rows.length);
+    dataSheet.getRange(2, 1, rows.length, 14).setValues(rows);
+
+    var lastFilledMinuteEpoch = (startMinute + fillCount - 1) * 60000;
+    SCRIPT_PROPS.setProperty("LAST_BLANK_FILL_TIME", lastFilledMinuteEpoch.toString());
+
+    console.log('🔧 看門狗回補：已補入 ' + fillCount + ' 列斷線記錄（' +
+        Utilities.formatDate(new Date(startMinute * 60000), "GMT+8", "HH:mm") + ' ~ ' +
+        Utilities.formatDate(new Date(lastFilledMinuteEpoch), "GMT+8", "HH:mm") + '）' +
+        (minutesToFill > MAX_FILL_PER_RUN ? '，尚餘 ' + (minutesToFill - fillCount) + ' 分鐘待下次執行繼續補' : ''));
 }
 // ======================== 🗄️ Purge前自動封存（依月份分頁） ========================
 function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
@@ -997,27 +1096,21 @@ function getOrCreateArchiveSheet(ss) {
   return archive;
 }
 
-function archiveHourlyAverage() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet();
-  var source = ss.getSheetByName(ARCHIVE_CONFIG.SOURCE_SHEET_NAME);
-  var archive = getOrCreateArchiveSheet(ss);
-
-  var now = new Date();
-  var targetBucketTime = new Date(now.getTime() - 60 * 60 * 1000);
-
-  var archiveLastRow = archive.getLastRow();
-  if (archiveLastRow >= 2) {
-    var lastArchived = archive.getRange(2, 1, 1, 2).getValues()[0];
-    var lastArchivedTime = parseRowDateTime(lastArchived[0], lastArchived[1]);
-    if (isSameHourBucket(lastArchivedTime, targetBucketTime)) {
-      console.log('該時段已封存過，跳過：' + targetBucketTime);
-      return;
-    }
-  }
+// 🆕 抽出共用的「計算指定小時桶統計」邏輯，讓正常封存與回補後重算都走同一份邏輯，
+// 避免兩處各自維護、行為不一致。
+// 🔧 同時修正：原本st === '正常'是嚴格比對，會讓「正常(重連:1次)」這類重連後的狀態字串
+// 被誤判成「感測器異常」而不是「正常」，拖低取樣率、拉高感測器異常率。
+// 改成indexOf('正常') === 0，只要是「正常」開頭都算正常。
+function computeHourlyStatsForBucket_(source, targetBucketTime) {
   var lastRow = source.getLastRow();
-  if (lastRow < 2) return;
+  if (lastRow < 2) return null;
 
-  var scanRows = Math.min(150, lastRow - 1);
+  // 🔧 重算歷史時段時，資料可能落在表格深處，不能只掃最新150列，
+  // 用「目標時段結束時間到現在」估算需要掃多少列(每分鐘約1列)，並保留緩衝空間。
+  var now = new Date();
+  var minutesSinceBucketEnd = Math.ceil((now.getTime() - (targetBucketTime.getTime() + 3600000)) / 60000);
+  var scanRows = Math.min(lastRow - 1, Math.max(200, minutesSinceBucketEnd + 200));
+
   var allData = source.getRange(2, 1, scanRows, source.getLastColumn()).getValues();
 
   var matchedRows = [];
@@ -1026,19 +1119,11 @@ function archiveHourlyAverage() {
     var dateVal = row[ARCHIVE_CONFIG.DATE_COL - 1];
     var timeVal = row[ARCHIVE_CONFIG.TIME_COL - 1];
     if (!dateVal || !timeVal) continue;
-
     var rowTime = parseRowDateTime(dateVal, timeVal);
     if (isNaN(rowTime.getTime())) continue;
-
-    if (isSameHourBucket(rowTime, targetBucketTime)) {
-      matchedRows.push(row);
-    }
+    if (isSameHourBucket(rowTime, targetBucketTime)) matchedRows.push(row);
   }
-
-  if (matchedRows.length === 0) {
-    console.log('目標時段沒有資料，略過本次封存：' + targetBucketTime);
-    return;
-  }
+  if (matchedRows.length === 0) return null;
 
   matchedRows.reverse();
 
@@ -1053,28 +1138,83 @@ function archiveHourlyAverage() {
 
   var lastRowOfHour = matchedRows[matchedRows.length - 1];
 
-  var avgTemp   = avgCol(2);
-  var avgHum    = avgCol(3);
-  var avgPres   = avgCol(4);
-  var avgLight  = avgCol(5);
-  var avgPPFD   = avgCol(6);
-  var avgSoilJ  = avgCol(7);
-  var avgSoilO  = avgCol(8);
-  var avgSoilP  = avgCol(9);
-  var lastCumJ  = lastRowOfHour[11];
-  var lastCumO  = lastRowOfHour[12];
-  var lastCumP  = lastRowOfHour[13];
-
   var normalCount = 0, disconnectCount = 0, sensorErrorCount = 0;
   for (var k = 0; k < matchedRows.length; k++) {
     var st = matchedRows[k][10];
-    if (st === '正常') { normalCount++; }
+    if (typeof st === 'string' && st.indexOf('正常') === 0) { normalCount++; }
     else if (st === '斷線') { disconnectCount++; }
     else if (st !== '' && st !== null) { sensorErrorCount++; }
   }
-  var sampleRate      = Math.min(100, Math.round((normalCount / 60) * 1000) / 10) + '%';
-  var disconnectRate  = Math.min(100, Math.round((disconnectCount / 60) * 1000) / 10) + '%';
-  var sensorErrorRate = Math.min(100, Math.round((sensorErrorCount / 60) * 1000) / 10) + '%';
+
+  return {
+    avgTemp: avgCol(2), avgHum: avgCol(3), avgPres: avgCol(4), avgLight: avgCol(5), avgPPFD: avgCol(6),
+    avgSoilJ: avgCol(7), avgSoilO: avgCol(8), avgSoilP: avgCol(9),
+    lastCumJ: lastRowOfHour[11], lastCumO: lastRowOfHour[12], lastCumP: lastRowOfHour[13],
+    sampleRate: Math.min(100, Math.round((normalCount / 60) * 1000) / 10) + '%',
+    disconnectRate: Math.min(100, Math.round((disconnectCount / 60) * 1000) / 10) + '%',
+    sensorErrorRate: Math.min(100, Math.round((sensorErrorCount / 60) * 1000) / 10) + '%'
+  };
+}
+
+// 🆕 回補資料進來後，如果它所屬的小時「已經」被封存過，就用最新資料重算覆蓋那一列。
+// 如果那個小時還沒被封存過(還在進行中，或還沒輪到觸發器)，就不動它，
+// 交給原本排程的archiveHourlyIfNeeded()處理，避免搶插入順序、造成重複列。
+function recomputeHourlyBucket_(targetBucketTime) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var source = ss.getSheetByName(ARCHIVE_CONFIG.SOURCE_SHEET_NAME);
+  var archive = ss.getSheetByName(ARCHIVE_CONFIG.ARCHIVE_SHEET_NAME);
+  if (!source || !archive) return;
+
+  var archiveLastRow = archive.getLastRow();
+  if (archiveLastRow < 2) return;
+
+  var targetRow = -1;
+  var archiveData = archive.getRange(2, 1, archiveLastRow - 1, 2).getValues();
+  for (var i = 0; i < archiveData.length; i++) {
+    var rowTime = parseRowDateTime(archiveData[i][0], archiveData[i][1]);
+    if (isSameHourBucket(rowTime, targetBucketTime)) { targetRow = i + 2; break; }
+  }
+  if (targetRow === -1) return;
+
+  var stats = computeHourlyStatsForBucket_(source, targetBucketTime);
+  if (!stats) return;
+
+  archive.getRange(targetRow, 3, 1, 14).setValues([[
+    stats.avgTemp, stats.avgHum, stats.avgPres, stats.avgLight, stats.avgPPFD,
+    stats.avgSoilJ, stats.avgSoilO, stats.avgSoilP,
+    stats.lastCumJ, stats.lastCumO, stats.lastCumP,
+    stats.sampleRate, stats.disconnectRate, stats.sensorErrorRate
+  ]]);
+
+  console.log('🔧 已重新計算並覆蓋 ' + Utilities.formatDate(targetBucketTime, 'GMT+8', 'yyyy/MM/dd HH') +
+    ':00 的每小時統計（原因：收到該時段的回補資料），正常：' + stats.sampleRate +
+    '，斷線：' + stats.disconnectRate + '，感測器異常：' + stats.sensorErrorRate);
+}
+
+function archiveHourlyAverage() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var source = ss.getSheetByName(ARCHIVE_CONFIG.SOURCE_SHEET_NAME);
+  var archive = getOrCreateArchiveSheet(ss);
+
+  var now = new Date();
+  var targetBucketTime = new Date(now.getTime() - 60 * 60 * 1000);
+  targetBucketTime = new Date(targetBucketTime.getFullYear(), targetBucketTime.getMonth(), targetBucketTime.getDate(), targetBucketTime.getHours());
+
+  var archiveLastRow = archive.getLastRow();
+  if (archiveLastRow >= 2) {
+    var lastArchived = archive.getRange(2, 1, 1, 2).getValues()[0];
+    var lastArchivedTime = parseRowDateTime(lastArchived[0], lastArchived[1]);
+    if (isSameHourBucket(lastArchivedTime, targetBucketTime)) {
+      console.log('該時段已封存過，跳過：' + targetBucketTime);
+      return;
+    }
+  }
+
+  var stats = computeHourlyStatsForBucket_(source, targetBucketTime);
+  if (!stats) {
+    console.log('目標時段沒有資料，略過本次封存：' + targetBucketTime);
+    return;
+  }
 
   var bucketDateStr = Utilities.formatDate(targetBucketTime, 'GMT+8', 'yyyy/MM/dd');
   var bucketHourStr = Utilities.formatDate(targetBucketTime, 'GMT+8', 'HH') + ':00:00';
@@ -1082,13 +1222,13 @@ function archiveHourlyAverage() {
   archive.insertRowBefore(2);
   archive.getRange(2, 1, 1, 16).setValues([[
     bucketDateStr, bucketHourStr,
-    avgTemp, avgHum, avgPres, avgLight, avgPPFD,
-    avgSoilJ, avgSoilO, avgSoilP,
-    lastCumJ, lastCumO, lastCumP,
-    sampleRate, disconnectRate, sensorErrorRate
+    stats.avgTemp, stats.avgHum, stats.avgPres, stats.avgLight, stats.avgPPFD,
+    stats.avgSoilJ, stats.avgSoilO, stats.avgSoilP,
+    stats.lastCumJ, stats.lastCumO, stats.lastCumP,
+    stats.sampleRate, stats.disconnectRate, stats.sensorErrorRate
   ]]);
   archive.getRange('B:B').setNumberFormat('HH:mm');
-  console.log('已封存 ' + bucketDateStr + ' ' + bucketHourStr + ' 均值，正常：' + sampleRate + '，斷線：' + disconnectRate + '，感測器異常：' + sensorErrorRate);
+  console.log('已封存 ' + bucketDateStr + ' ' + bucketHourStr + ' 均值，正常：' + stats.sampleRate + '，斷線：' + stats.disconnectRate + '，感測器異常：' + stats.sensorErrorRate);
 }
 
 function archiveHourlyIfNeeded() {
@@ -1488,10 +1628,10 @@ function getOrCreateElevCurveSheet_(ss) {
   var sheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
   if (!sheet) {
     sheet = ss.insertSheet(ELEV_CURVE_SHEET_NAME);
-    sheet.getRange(1, 1, 1, 6).setValues([[
-      '仰角區間下限', '仰角區間上限', '樣本數', '比值總和', '平均比值', '標準差'
-    ]]);
   }
+  sheet.getRange(1, 1, 1, 7).setValues([[
+    '仰角區間下限', '仰角區間上限', '太陽時段', '樣本數', '比值總和', '平均比值', '標準差'
+  ]]);
   return sheet;
 }
 
@@ -1500,19 +1640,22 @@ function loadExistingBins_(sheet) {
   var bins = {};
   if (lastRow < 2) return bins;
 
-  var data = sheet.getRange(2, 1, lastRow - 1, 6).getValues();
+  var data = sheet.getRange(2, 1, lastRow - 1, 7).getValues();
   for (var i = 0; i < data.length; i++) {
     var binLow = data[i][0];
-    var count = Number(data[i][2]) || 0;
-    var sum = Number(data[i][3]) || 0;
-    var std = Number(data[i][5]) || 0;
+    var period = data[i][2];
+    var count = Number(data[i][3]) || 0;
+    var sum = Number(data[i][4]) || 0;
+    var std = Number(data[i][6]) || 0;
     var mean = count > 0 ? sum / count : 0;
     var sumSq = count > 0 ? count * (std * std + mean * mean) : 0;
     var binIndex = Math.floor(binLow / ELEV_CURVE_BIN_SIZE);
-    bins[binIndex] = { count: count, sum: sum, sumSq: sumSq };
+    var key = binIndex + '_' + period;
+    bins[key] = { binIndex: binIndex, period: period, count: count, sum: sum, sumSq: sumSq };
   }
   return bins;
 }
+
 function updateElevationCorrectionCurve() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var source = ss.getSheetByName('資訊總表');
@@ -1534,14 +1677,15 @@ function updateElevationCorrectionCurve() {
   }
   var scanRows = Math.min(newRowCount, 5000);
 
-  var data = source.getRange(2, 16, scanRows, 7).getValues();
+  // 🆕 改讀 A~V 全部欄位，因為要用日期(A)+時間(B)重建時間戳算 hourAngle
+  var data = source.getRange(2, 1, scanRows, 22).getValues();
 
   var carryInState = SCRIPT_PROPS.getProperty('BARE_LOCATION_STATE') || '';
   var chronological = data.slice().reverse();
   var locationStates = [];
   var currentState = carryInState;
   for (var c = 0; c < chronological.length; c++) {
-    var marker = chronological[c][6];
+    var marker = chronological[c][21]; // V欄 裸版位置（人為移動感光器標記，維持原邏輯）
     if (marker && marker.toString().trim() !== '') {
       currentState = marker.toString().trim();
     }
@@ -1552,16 +1696,18 @@ function updateElevationCorrectionCurve() {
   var bins = loadExistingBins_(curveSheet);
   var skippedSaturated = 0;
   var skippedShaded = 0;
+  var skippedNoTime = 0;
 
   for (var i = 0; i < data.length; i++) {
-    var covered = data[i][0];
-    var elevation = data[i][1];
-    var confidence = data[i][2];
-    var bare = data[i][4];
+    var dateVal = data[i][0];   // A 日期
+    var timeVal = data[i][1];   // B 時間
+    var covered = data[i][15];  // P 未修正原始值
+    var elevation = data[i][16];// Q 仰角
+    var bare = data[i][19];     // T 光照(裸版)
 
     if (elevation === '' || elevation === null || isNaN(elevation)) continue;
-    if (confidence === '' || confidence === null || isNaN(confidence)) continue;
-    if (Number(confidence) < ELEV_CURVE_MIN_CONFIDENCE) continue;
+    // 🆕 移除可信度≥90門檻，改用陽台幾何下限，讓日出到日落全區間都納入統計
+    if (Number(elevation) < BALCONY_EL_MIN) continue;
 
     var stateStr = locationStates[i] || '';
     if (stateStr.indexOf('遮陰') !== -1 || stateStr.indexOf('遮蔭') !== -1) {
@@ -1572,24 +1718,37 @@ function updateElevationCorrectionCurve() {
     if (isSaturatedOrInvalid_(covered)) { skippedSaturated++; continue; }
     if (isSaturatedOrInvalid_(bare)) { skippedSaturated++; continue; }
 
+    if (!(dateVal instanceof Date) || !(timeVal instanceof Date)) { skippedNoTime++; continue; }
+    // 🆕 重建當下時間戳，算真太陽時 hourAngle，判斷正午前/正午後
+    var ts = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate(),
+                       timeVal.getHours(), timeVal.getMinutes(), timeVal.getSeconds());
+    var pos = calculateSolarPosition_(ts, SENSOR_LAT, SENSOR_LON);
+    var period = pos.hourAngle < 0 ? 'AM' : 'PM';
+
     var ratio = Number(bare) / Number(covered);
     var binIndex = Math.floor(Number(elevation) / ELEV_CURVE_BIN_SIZE);
+    var key = binIndex + '_' + period;
 
-    if (!bins[binIndex]) bins[binIndex] = { count: 0, sum: 0, sumSq: 0 };
-    bins[binIndex].count += 1;
-    bins[binIndex].sum += ratio;
-    bins[binIndex].sumSq += ratio * ratio;
+    if (!bins[key]) bins[key] = { binIndex: binIndex, period: period, count: 0, sum: 0, sumSq: 0 };
+    bins[key].count += 1;
+    bins[key].sum += ratio;
+    bins[key].sumSq += ratio * ratio;
   }
 
-  var binIndexList = Object.keys(bins).map(Number).sort(function(a, b) { return a - b; });
-  var outputRows = binIndexList.map(function(idx) {
-    var b = bins[idx];
+  var keys = Object.keys(bins).sort(function(a, b) {
+    var ba = bins[a], bb = bins[b];
+    if (ba.binIndex !== bb.binIndex) return ba.binIndex - bb.binIndex;
+    return ba.period < bb.period ? -1 : 1; // AM排在PM前
+  });
+  var outputRows = keys.map(function(k) {
+    var b = bins[k];
     var mean = b.sum / b.count;
     var variance = (b.sumSq / b.count) - (mean * mean);
     var std = variance > 0 ? Math.sqrt(variance) : 0;
     return [
-      idx * ELEV_CURVE_BIN_SIZE,
-      (idx + 1) * ELEV_CURVE_BIN_SIZE,
+      b.binIndex * ELEV_CURVE_BIN_SIZE,
+      (b.binIndex + 1) * ELEV_CURVE_BIN_SIZE,
+      b.period,
       b.count,
       Math.round(b.sum * 10000) / 10000,
       Math.round(mean * 10000) / 10000,
@@ -1600,22 +1759,26 @@ function updateElevationCorrectionCurve() {
   if (outputRows.length > 0) {
     var oldLastRow = curveSheet.getLastRow();
     if (oldLastRow > 1) {
-      curveSheet.getRange(2, 1, oldLastRow - 1, 6).clearContent();
+      curveSheet.getRange(2, 1, oldLastRow - 1, 7).clearContent();
     }
-    curveSheet.getRange(2, 1, outputRows.length, 6).setValues(outputRows);
+    curveSheet.getRange(2, 1, outputRows.length, 7).setValues(outputRows);
   }
 
-  // 🔧 修正：原本存的是 chronological[0][6]（這批資料裡「最舊」一列的原始標記值，
-  // 常常是空字串），應該存這批資料處理完之後、代表「最新狀態」的 currentState，
-  // 下次執行時才會從正確的地方接續判斷遮陰/直曬。
   if (chronological.length > 0) {
     SCRIPT_PROPS.setProperty('BARE_LOCATION_STATE', currentState);
   }
 
   SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', (lastProcessedRow + scanRows).toString());
 
-  console.log('仰角修正曲線更新完成，本次新增處理 ' + scanRows + ' 列(過濾封頂/異常 ' + skippedSaturated + ' 筆、過濾遮蔭 ' + skippedShaded + ' 筆)，累積 ' + outputRows.length + ' 個仰角區間，目前進度 ' + (lastProcessedRow + scanRows) + '/' + totalRows);
-}
+  console.log('仰角修正曲線更新完成，本次新增處理 ' + scanRows + ' 列(過濾封頂/異常 ' + skippedSaturated
+    + ' 筆、過濾遮蔭 ' + skippedShaded + ' 筆、缺時間戳 ' + skippedNoTime
+    + ' 筆)，累積 ' + outputRows.length + ' 個(仰角區間×時段)組合，目前進度 '
+    + (lastProcessedRow + scanRows) + '/' + totalRows);
+  SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', (lastProcessedRow + scanRows).toString());
+
+  recalibrateElevationCorrectionFormula(); // 🆕 曲線更新後立刻重新校正公式，達成滾動式自動變更基數
+
+  console.log('仰角修正曲線更新完成...');}
 function resetElevationCorrectionCurve() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var curveSheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
@@ -1626,7 +1789,7 @@ function resetElevationCorrectionCurve() {
   SCRIPT_PROPS.deleteProperty('ELEV_CURVE_LAST_ROW');
   SCRIPT_PROPS.deleteProperty('BARE_LOCATION_STATE');
   console.log('仰角修正曲線統計已重置，下次執行updateElevationCorrectionCurve將從頭掃描全部歷史資料');
-}
+  }
 function setOtaTargetVersion() {
     SCRIPT_PROPS.setProperty("OTA_TARGET_VERSION", "ESP32072102"); // 🔧 改成你這次要推送的版本號
     SpreadsheetApp.getUi().alert("✅ OTA目標版本已設定為：ESP32072102");
