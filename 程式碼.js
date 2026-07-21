@@ -285,6 +285,12 @@ function doGet(e) {
             otaNeeded = true;
             SCRIPT_PROPS.setProperty("OTA_START_TIME", nowTime.toString());
             dliSheet.getRange("I7").setValue("⏳ 正在下載與更新韌體...");
+        } else if (otaStatus.indexOf("❌") === 0) {
+            // 🔧 修正：之前這裡沒有攔截，狀態變成❌後，下一次打卡因為versionMismatch仍為true
+            // 會直接掉進下面的versionMismatch分支、無條件又觸發一次OTA，
+            // 導致「⏳下載中→逾時❌→立刻又⏳」的無限重試迴圈，完全繞過原本要停止重試的設計。
+            // 已經失敗過一次，維持otaNeeded=false，不自動重試；
+            // 要重新嘗試只能靠LINE「更新韌體」手動觸發(那會把狀態改成🔄，才會進入上面的分支)。
         } else if (versionMismatch) {
             // 沒有手動觸發，但版本比對不同(例如直接改了OTA_TARGET_VERSION)，一樣視為需要更新
             otaNeeded = true;
@@ -1622,6 +1628,6 @@ function resetElevationCorrectionCurve() {
   console.log('仰角修正曲線統計已重置，下次執行updateElevationCorrectionCurve將從頭掃描全部歷史資料');
 }
 function setOtaTargetVersion() {
-    SCRIPT_PROPS.setProperty("OTA_TARGET_VERSION", "ESP32072002"); // 🔧 改成你這次要推送的版本號
-    SpreadsheetApp.getUi().alert("✅ OTA目標版本已設定為：ESP32072002");
+    SCRIPT_PROPS.setProperty("OTA_TARGET_VERSION", "ESP32072102"); // 🔧 改成你這次要推送的版本號
+    SpreadsheetApp.getUi().alert("✅ OTA目標版本已設定為：ESP32072102");
 }
