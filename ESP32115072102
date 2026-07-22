@@ -1,0 +1,1000 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <WiFiClientSecure.h>
+#include "time.h"
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <BH1750.h>
+
+
+
+
+// =========================================================================
+// 🚀【手動填空專區】
+// =========================================================================
+const char* ssid     = "218";
+const char* password = ""; // ⬅️ 請記得填入你家 Wi-Fi 密碼
+const String WEB_API_KEY = "JunjunBalconySecret2026"; // 🛡️ 金鑰驗證密碼
+const String GAS_URL = "https://script.google.com/macros/s/AKfycbzA8hEvucrmAisTFjhtFxz7h3qFLy4OzBtsBWFPTDMlw8nx__wRFUdD3l-E0nSGuSxI5g/exec";
+
+// 🆕 OTA用：每次燒錄新版本前,務必同步修改這裡的版本字串,
+// 並跟GAS端setOtaTargetVersion()、Drive上傳的firmware.bin是同一版
+const String FIRMWARE_VERSION = "ESP32072102";
+const String OTA_WORKER_URL = "https://esp32-ota-proxythrobbing-disk-0927.flightinseans.workers.dev/?proxy_key=Mn495159";
+
+// 🆕 OTA安全性：Cloudflare Workers.dev 的根憑證(CA)PEM，用於 setCACert() 憑證鏈驗證，
+// 取代原本的 setInsecure()（跳過驗證，容易被中間人攻擊置換韌體）。
+// 取得方式：在電腦終端機執行
+//   openssl s_client -connect esp32-ota-proxythrobbing-disk-0927.flightinseans.workers.dev:443 -showcerts </dev/null 2>/dev/null | openssl x509 -outform PEM
+// 會印出多張憑證，把「憑證鏈最上層(通常是最後一張，Issuer=Subject自簽的那張根憑證)」的
+// -----BEGIN CERTIFICATE----- ... -----END CERTIFICATE----- 整段複製貼到下面的雙引號內。
+// 目前先留空字串，若未填入，OTA仍會退回 setInsecure() 並在Serial印出警告，行為與修改前相同、不影響現有功能。
+const char* OTA_ROOT_CA_PEM = "";
+
+
+
+
+const int RELAY_J_PIN = 25;
+const int RELAY_O_PIN = 26;
+const int RELAY_P_PIN = 27;
+// 探針共用VCC供電線開關：探針board的VCC不直接接ESP32常電,而是透過這一路繼電器供電,
+// 讀取前才通電、讀完立刻斷電,大幅減少電容式探針長時間通電造成的電極/電路老化風險。
+const int RELAY_4_PIN = 14;
+
+
+
+
+const int SOIL_J_PIN = 32;
+const int SOIL_O_PIN = 33;
+const int SOIL_P_PIN = 34;
+
+
+
+
+const int AIR_VALUE   = 3400;
+const int WATER_VALUE = 1300;
+
+
+
+
+// 探針通電後到讀值穩定所需緩衝時間(ms),含繼電器機械切換延遲(~5-10ms) + 電容式探針震盪電路穩定時間。
+const unsigned long PROBE_SETTLE_MS = 60;
+
+
+
+
+// =========================================================================
+// 🆕 BH1750 日出日落休眠設定
+// =========================================================================
+// 陽台實際座標(跟GAS端SENSOR_LAT/SENSOR_LON保持一致,兩邊算出來的日出日落才會吻合)
+const double SENSOR_LAT = 21.96766;
+const double SENSOR_LON = 120.75801;
+const int TIMEZONE_OFFSET = 8; // GMT+8
+
+
+const float LUX_SLEEP_THRESHOLD = 10.0;   // 讀值低於此值,且已進入允許休眠時段,才觸發休眠
+const int SUN_TIME_BUFFER_MIN = 30;       // 日出前/日落後緩衝分鐘數
+
+
+bool lightSensorAsleep = false;
+int wakeMinuteOfDay = 5 * 60;             // 喚醒時刻(分鐘數,預設05:00,每日會重新計算覆蓋)
+int sleepEligibleMinuteOfDay = 19 * 60;   // 允許休眠時刻(分鐘數,預設19:00,每日會重新計算覆蓋)
+int lastSunCalcYday = -1;                 // 上次計算日出日落時的年積日,用來判斷是否需要重新計算
+
+
+// =========================================================================
+// 🆕 I2C Bus Recovery / BH1750(0x5C裸版) 自動恢復設定
+// =========================================================================
+const int I2C_SDA_PIN = 21;
+const int I2C_SCL_PIN = 22;
+
+// 🆕 BH1750(0x5C裸板)獨立第二組I2C bus,不再與AHT20/BMP280/BH1750(0x23)共用主bus,
+// 避免任一裝置接觸不良時,連坐拖累其他裝置(這是7/19實際發生過的現象:動AHT20/BMP280接頭反而讓0x5C恢復正常)。
+const int I2C_SDA_PIN2 = 4;
+const int I2C_SCL_PIN2 = 5;
+
+
+int bh1750BareFailCount = 0;              // 連續讀取失敗次數(已初始化成功、但讀值持續失敗時累計)
+const int MAX_FAIL_BEFORE_RECOVERY = 3;   // 連續失敗達此次數,觸發bus recovery+重新初始化
+
+
+int bh1750BareInitRetryCount = 0;         // 尚未初始化成功時,累計上傳週期數
+const int INIT_RETRY_INTERVAL = 5;        // 每累計5個上傳週期(約5分鐘),嘗試重新初始化一次
+
+
+unsigned long bh1750BareRecoveryTotal = 0; // 累計recovery觸發次數,方便在Serial追查頻率
+
+
+
+
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+BH1750 lightMeter;              // 第一顆 BH1750,ADDR接GND,位址0x23,掛在主bus(21/22)
+TwoWire I2CTwo = TwoWire(1);     // 🆕 第二組硬體I2C,專供BH1750(0x5C)裸板獨立使用
+BH1750 lightMeter2(0x5C);       // 🆕 第二顆 BH1750,ADDR接3.3V,位址0x5C,掛在獨立bus(4/5)
+bool lightMeter2Ready = false;  // 開機初始化是否成功,失敗則後續讀值一律回報-1異常
+
+
+
+
+unsigned long lastUploadTime = 0;
+const unsigned long uploadInterval = 60000;
+
+
+
+
+bool relayJActive = false; unsigned long relayJStartTime = 0; unsigned long relayJDuration = 0;
+bool relayOActive = false; unsigned long relayOStartTime = 0; unsigned long relayODuration = 0;
+bool relayPActive = false; unsigned long relayPStartTime = 0; unsigned long relayPDuration = 0;
+
+
+
+
+int wifiDisconnectCount = 0;
+bool wasConnected = true;
+
+
+// =========================================================================
+// 🆕 斷線資訊回補(Offline Backfill)
+// 用途：WiFi斷線期間，仍依原本60秒週期在背景取樣感測器數值並暫存於環形緩衝區
+//      (不重新對探針供電量測，沿用快取，避免無人看管時頻繁通斷繼電器)；
+//      重新連線後，依時間先後把緩衝區內容逐筆補傳給GAS，避免斷線期間的資料出現空窗。
+// =========================================================================
+#define BACKFILL_MAX 60   // 緩衝上限筆數(預設60筆≈60分鐘，可依RAM/預期斷線時長調整)
+
+struct BackfillRecord {
+  time_t ts;               // 取樣當下的UTC epoch秒數；NTP尚未同步時為0(回補時會略過，避免時間軸錯亂)
+  float temp, hum, pres, light, light2;
+  int soilJ, soilO, soilP;
+  unsigned long soilAgeJ, soilAgeO, soilAgeP;
+  char statusMessage[48];
+  bool valid;
+};
+
+BackfillRecord backfillBuffer[BACKFILL_MAX];
+int backfillHead = 0;    // 下一筆寫入位置(環形)
+int backfillCount = 0;   // 目前緩衝區內有效筆數
+
+
+// 🆕 collectSensorReading()的回傳型別，供正常上傳與離線背景取樣共用同一份感測器讀值邏輯
+struct SensorReading {
+  float temp, hum, pres, light, light2;
+  int soilJ, soilO, soilP;
+  unsigned long soilAgeJ, soilAgeO, soilAgeP;
+  String statusMessage;
+  time_t ts;
+};
+
+
+
+
+// 土壤濕度快取：每10分鐘重新實測一次,其余時間沿用快取值,減少探針通電頻率
+unsigned long lastSoilReadTime = 0;
+const unsigned long soilReadInterval = 600000; // 10分鐘
+int cachedSoilJ = 0, cachedSoilO = 0, cachedSoilP = 0;
+
+
+
+
+// 各株獨立記錄「最後一次實際量測」的時間點(millis),用來反推各自資料的新鮮度(秒)
+unsigned long soilReadTimeJ = 0, soilReadTimeO = 0, soilReadTimeP = 0;
+
+
+
+
+// 澆水驗證機制：啟動馬達前強制重測,啟動後2分鐘內持續強制重測以供比對
+unsigned long verifyEndJ = 0, verifyEndO = 0, verifyEndP = 0;
+int soilAtWaterStartJ = -1, soilAtWaterStartO = -1, soilAtWaterStartP = -1;
+bool verifyPendingJ = false, verifyPendingO = false, verifyPendingP = false;
+unsigned long motorLockUntilJ = 0, motorLockUntilO = 0, motorLockUntilP = 0; // 檢測到濕度沒上升後,鎖定自動澆水2小時
+
+
+
+
+// 探針共用電源開關：LOW=通電,HIGH=斷電
+void probesPowerOn() {
+digitalWrite(RELAY_4_PIN, LOW);
+delay(PROBE_SETTLE_MS);
+}
+void probesPowerOff() {
+digitalWrite(RELAY_4_PIN, HIGH);
+}
+
+
+
+
+// 強制重新量測三格土壤濕度並更新快取(開機初始化、澆水前決策、驗證窗內都會用到)
+// 讀取前才通電、三支一次讀完後立刻斷電,避免探針長時間通電
+void refreshSoilCache() {
+probesPowerOn();
+unsigned long t = millis();
+cachedSoilJ = getSoilAverage(SOIL_J_PIN); soilReadTimeJ = t;
+cachedSoilO = getSoilAverage(SOIL_O_PIN); soilReadTimeO = t;
+cachedSoilP = getSoilAverage(SOIL_P_PIN); soilReadTimeP = t;
+lastSoilReadTime = t;
+probesPowerOff();
+}
+
+
+// =========================================================================
+// 🆕 I2C Bus Recovery
+// 用途：當BH1750(0x5C裸版)因供電雜訊/EMI導致SDA被卡在低電位、或整條I2C bus鎖死時,
+//      軟體手動打出9個SCL脈衝逼迫從機釋放SDA,再送出STOP條件,最後重新Wire.begin()。
+//      這是業界標準的I2C bus recovery流程,無法根治雜訊源頭,但能讓bus在幾十毫秒內
+//      恢復可通訊狀態,不必等到手動重開機。
+// =========================================================================
+void i2cBusRecovery() {
+  Wire.end();
+  delay(10);
+
+  pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN, OUTPUT);
+  digitalWrite(I2C_SCL_PIN, HIGH);
+  delayMicroseconds(5);
+
+  // 若SDA被卡在低電位,打9個SCL脈衝逼迫從機釋放
+  if (digitalRead(I2C_SDA_PIN) == LOW) {
+    for (int i = 0; i < 9; i++) {
+      digitalWrite(I2C_SCL_PIN, LOW);
+      delayMicroseconds(5);
+      digitalWrite(I2C_SCL_PIN, HIGH);
+      delayMicroseconds(5);
+    }
+  }
+
+  // 手動送出一個STOP條件,結束可能卡住的傳輸(SDA low->high, 同時SCL維持high)
+  pinMode(I2C_SDA_PIN, OUTPUT);
+  digitalWrite(I2C_SDA_PIN, LOW);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SCL_PIN, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SDA_PIN, HIGH);
+  delayMicroseconds(5);
+
+  // 恢復I2C腳位功能,重新啟動Wire
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  delay(50);
+
+  bh1750BareRecoveryTotal++;
+  Serial.println("🔧 已執行I2C bus recovery(累計第" + String(bh1750BareRecoveryTotal) + "次)");
+}
+
+
+// 🆕 BH1750(0x5C裸板)專屬第二組I2C bus(GPIO4/5)的recovery,邏輯與主bus版本相同,
+// 但腳位、TwoWire物件都是獨立的,不會動到主bus(AHT20/BMP280/BH1750 0x23)。
+void i2cBusRecovery2_() {
+  I2CTwo.end();
+  delay(10);
+
+  pinMode(I2C_SDA_PIN2, INPUT_PULLUP);
+  pinMode(I2C_SCL_PIN2, OUTPUT);
+  digitalWrite(I2C_SCL_PIN2, HIGH);
+  delayMicroseconds(5);
+
+  if (digitalRead(I2C_SDA_PIN2) == LOW) {
+    for (int i = 0; i < 9; i++) {
+      digitalWrite(I2C_SCL_PIN2, LOW);
+      delayMicroseconds(5);
+      digitalWrite(I2C_SCL_PIN2, HIGH);
+      delayMicroseconds(5);
+    }
+  }
+
+  pinMode(I2C_SDA_PIN2, OUTPUT);
+  digitalWrite(I2C_SDA_PIN2, LOW);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SCL_PIN2, HIGH);
+  delayMicroseconds(5);
+  digitalWrite(I2C_SDA_PIN2, HIGH);
+  delayMicroseconds(5);
+
+  I2CTwo.begin(I2C_SDA_PIN2, I2C_SCL_PIN2);
+  delay(50);
+
+  bh1750BareRecoveryTotal++;
+  Serial.println("🔧 已執行BH1750(0x5C)獨立bus recovery(累計第" + String(bh1750BareRecoveryTotal) + "次)");
+}
+
+
+
+
+// =========================================================================
+// 🆕 太陽仰角計算(NOAA簡化演算法,與GAS端calculateSolarElevation_邏輯一致)
+// =========================================================================
+int dayOfYearCalc(int year, int month, int day) {
+ int daysInMonth[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+ bool leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
+ if (leap) daysInMonth[1] = 29;
+ int doy = day;
+ for (int i = 0; i < month - 1; i++) doy += daysInMonth[i];
+ return doy;
+}
+
+
+float calcSolarElevation(int year, int month, int day, double hourDecimal, double lat, double lon, int tzOffset) {
+ int dayOfYear = dayOfYearCalc(year, month, day);
+ double gamma = (2.0 * PI / 365.0) * (dayOfYear - 1 + (hourDecimal - 12.0) / 24.0);
+
+
+ double eqtime = 229.18 * (0.000075 + 0.001868 * cos(gamma) - 0.032077 * sin(gamma)
+                  - 0.014615 * cos(2 * gamma) - 0.040849 * sin(2 * gamma));
+ double decl = 0.006918 - 0.399912 * cos(gamma) + 0.070257 * sin(gamma)
+               - 0.006758 * cos(2 * gamma) + 0.000907 * sin(2 * gamma)
+               - 0.002697 * cos(3 * gamma) + 0.00148 * sin(3 * gamma);
+
+
+ double timeOffset = eqtime + 4 * lon - 60 * tzOffset;
+ double trueSolarTime = hourDecimal * 60.0 + timeOffset;
+ double hourAngle = (trueSolarTime / 4.0) - 180.0;
+
+
+ double latRad = lat * PI / 180.0;
+ double haRad = hourAngle * PI / 180.0;
+
+
+ double cosZenith = sin(latRad) * sin(decl) + cos(latRad) * cos(decl) * cos(haRad);
+ if (cosZenith > 1) cosZenith = 1;
+ if (cosZenith < -1) cosZenith = -1;
+ double zenithRad = acos(cosZenith);
+ return 90.0 - (zenithRad * 180.0 / PI);
+}
+
+
+// 掃描今天0:00~23:59每一分鐘的太陽仰角,找出日出/日落時刻(分鐘數),
+// 再前後各加30分鐘緩衝,算出實際的喚醒時刻/允許休眠時刻。
+// 一天只需要執行一次(日期變更時觸發),1440次三角函數運算對ESP32來說負擔很小。
+void computeSunTimesForToday(struct tm &timeinfo) {
+ int year = timeinfo.tm_year + 1900;
+ int month = timeinfo.tm_mon + 1;
+ int day = timeinfo.tm_mday;
+
+
+ int firstUp = -1, lastUp = -1;
+ bool prevAbove = false;
+
+
+ for (int m = 0; m < 1440; m++) {
+   double hourDecimal = m / 60.0;
+   float elev = calcSolarElevation(year, month, day, hourDecimal, SENSOR_LAT, SENSOR_LON, TIMEZONE_OFFSET);
+   bool above = (elev > 0);
+   if (above && !prevAbove && firstUp == -1) firstUp = m;
+   if (above) lastUp = m;
+   prevAbove = above;
+ }
+
+
+ if (firstUp == -1 || lastUp == -1) {
+   // 理論上台灣緯度不會發生永晝/永夜,這裡只是防呆,給一組保守安全值
+   wakeMinuteOfDay = 5 * 60;
+   sleepEligibleMinuteOfDay = 19 * 60;
+   Serial.println("⚠️ 太陽仰角掃描異常,套用預設安全時段(05:00~19:00)");
+ } else {
+   wakeMinuteOfDay = firstUp - SUN_TIME_BUFFER_MIN;
+   sleepEligibleMinuteOfDay = lastUp + SUN_TIME_BUFFER_MIN;
+   Serial.println("☀️ 今日日出約 " + String(firstUp / 60) + ":" + String(firstUp % 60) +
+                   "，日落約 " + String(lastUp / 60) + ":" + String(lastUp % 60));
+   Serial.println("   → 喚醒時刻：" + String(wakeMinuteOfDay / 60) + ":" + String(wakeMinuteOfDay % 60) +
+                   "，允許休眠時刻：" + String(sleepEligibleMinuteOfDay / 60) + ":" + String(sleepEligibleMinuteOfDay % 60));
+ }
+ lastSunCalcYday = timeinfo.tm_yday;
+}
+
+
+// 🆕 兩顆BH1750共用同一套日出日落時機,一起喚醒/一起休眠(裝在同一陽台,日照條件一致)
+void wakeLightSensor() {
+ lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE);
+ lightMeter.setMTreg(69);
+ if (lightMeter2Ready) {
+   lightMeter2.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &I2CTwo);  // 明確帶入0x5C位址與獨立bus
+   lightMeter2.setMTreg(31); // 🔧 裸板強光上限拉高,與setup()保持一致
+ }
+ lightSensorAsleep = false;
+ Serial.println("☀️ 已達喚醒時刻，BH1750(兩顆)恢復量測");
+}
+
+
+void sleepLightSensor() {
+ lightMeter.configure(BH1750::UNCONFIGURED);  // 送出Power Down指令,取代不存在的powerDown()
+ if (lightMeter2Ready) {
+   lightMeter2.configure(BH1750::UNCONFIGURED);
+ }
+ lightSensorAsleep = true;
+ Serial.println("🌙 光照低於閾值且已入夜，BH1750(兩顆)進入休眠");
+}
+
+
+
+
+void setup() {
+ Serial.begin(115200);
+ delay(1000);
+
+
+ // 🆕 印出重置原因,方便日後追查是否因異常重開機導致同一分鐘出現重複上傳的空包
+ Serial.println("🔍 本次開機重置原因代碼: " + String(esp_reset_reason()));
+
+
+ pinMode(RELAY_J_PIN, OUTPUT);
+ pinMode(RELAY_O_PIN, OUTPUT);
+ pinMode(RELAY_P_PIN, OUTPUT);
+ pinMode(RELAY_4_PIN, OUTPUT);
+ digitalWrite(RELAY_J_PIN, HIGH);
+ digitalWrite(RELAY_O_PIN, HIGH);
+ digitalWrite(RELAY_P_PIN, HIGH);
+ digitalWrite(RELAY_4_PIN, HIGH); // 探針電源預設關閉,只在量測時才開啟
+
+
+ Serial.println("⚡ 正在執行 I2C 總線開機大掃除...");
+ Wire.end();
+ delay(100);
+ Wire.begin(21, 22);
+ delay(100);
+
+ // 🆕 BH1750(0x5C裸板)獨立第二組I2C bus初始化,與主bus完全分開
+ I2CTwo.begin(I2C_SDA_PIN2, I2C_SCL_PIN2);
+ delay(100);
+
+
+ // 硬體初始化與動態診斷
+ if (!aht.begin()) { Serial.println("❌ 找不到 AHT20 感測器！"); }
+ if (!bmp.begin(0x77)) {
+   if (!bmp.begin(0x76)) Serial.println("❌ 找不到 BMP280 氣壓感測器！");
+ }
+ // 0x23維持預設MTreg=69(上限54,612.5 Lux),故意不跟裸板一起調低,
+ // 因為這顆同時肩負日出日落休眠判斷(LUX_SLEEP_THRESHOLD=10),
+ // 調低MTreg會犧牲低光解析度,影響清晨/黃昏休眠時機判斷準確度。
+ if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE)) {
+   Serial.println("❌ 找不到 BH1750(0x23) 光照感測器！");
+ } else {
+   lightMeter.setMTreg(69);
+   Serial.println("✅ BH1750(0x23) 初始化成功！");
+ }
+
+
+ // 🆕 第二顆 BH1750(0x5C,ADDR接3.3V)初始化
+ // ⚠️ 務必明確傳入0x5C位址!begin()的addr參數預設值是0x23(BH1750_DEFAULT_I2CADDR),
+ //    只傳mode不傳addr的話,會用預設值覆蓋掉建構子設定的位址,導致這個物件實際上
+ //    跟第一顆搶著問同一顆0x23(1號)裝置,造成兩欄數值一模一樣、1號拔掉兩邊都死的現象。
+ // 🆕 明確帶入&I2CTwo,讓這顆完全掛在獨立bus上,不再與AHT20/BMP280/BH1750(0x23)共用
+ if (!lightMeter2.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &I2CTwo)) {
+   Serial.println("❌ 找不到 BH1750(0x5C) 第二顆光照感測器！(獨立bus)");
+   lightMeter2Ready = false;
+ } else {
+   // 🔧 裸板直曬強光下MTreg=69(預設)僅能測到54,612.5 Lux就飽和封頂,
+   //    改為MTreg=31(可設定最低值),上限拉高到約121,580 Lux,
+   //    犧牲低光解析度換取強光不再封頂(裸板不負責休眠判斷,可以這樣取捨)。
+   lightMeter2.setMTreg(31);
+   lightMeter2Ready = true;
+   Serial.println("✅ BH1750(0x5C) 第二顆初始化成功！(獨立bus,MTreg=31,強光上限已拉高)");
+ }
+
+
+ connectWiFi();
+
+
+ // 🆕 WiFi連線後同步NTP時間,BH1750日出日落休眠判斷需要準確的即時時間
+ configTime(TIMEZONE_OFFSET * 3600, 0, "pool.ntp.org", "time.nist.gov");
+ Serial.print("🕐 正在同步NTP時間");
+ struct tm timeinfo;
+ int ntpRetry = 0;
+ while (!getLocalTime(&timeinfo) && ntpRetry < 10) {
+   Serial.print(".");
+   delay(500);
+   ntpRetry++;
+ }
+ if (getLocalTime(&timeinfo)) {
+   Serial.println("\n✅ NTP時間同步成功: " + String(timeinfo.tm_hour) + ":" + String(timeinfo.tm_min));
+   computeSunTimesForToday(timeinfo); // 開機時先算好今天的日出日落,避免第一輪循環判斷用到預設值
+ } else {
+   Serial.println("\n⚠️ NTP時間同步失敗,BH1750休眠判斷將暫用預設安全時段(05:00~19:00),之後每輪會重試取得時間");
+ }
+
+
+ // 開機立即量一次土壤濕度,避免第一筆上傳送出未初始化的0%假資料
+ refreshSoilCache();
+}
+
+
+
+
+void loop() {
+ if (WiFi.status() != WL_CONNECTED) {
+   if (wasConnected) { wifiDisconnectCount++; wasConnected = false; }
+   static unsigned long lastRetryTime = 0;
+   if (millis() - lastRetryTime > 10000) { lastRetryTime = millis(); WiFi.disconnect(); WiFi.begin(ssid, password); }
+ } else {
+   // 🆕 剛從斷線恢復連線：先把離線期間暫存的資料回補給GAS，再進行本輪的正常上傳
+   if (!wasConnected) {
+     flushBackfillBuffer();
+   }
+   wasConnected = true;
+ }
+
+
+ if (millis() - lastUploadTime >= uploadInterval || lastUploadTime == 0) {
+   lastUploadTime = millis();
+   if (WiFi.status() == WL_CONNECTED) {
+     uploadAndCheckCommand();
+   } else {
+     // 🆕 斷線中：沿用同一個60秒週期，改為背景取樣暫存，而不是整段空窗
+     bufferOfflineSample();
+   }
+ }
+
+
+ unsigned long now = millis();
+ if (relayJActive && (now - relayJStartTime >= relayJDuration)) { digitalWrite(RELAY_J_PIN, HIGH); relayJActive = false; }
+ if (relayOActive && (now - relayOStartTime >= relayODuration)) { digitalWrite(RELAY_O_PIN, HIGH); relayOActive = false; }
+ if (relayPActive && (now - relayPStartTime >= relayPDuration)) { digitalWrite(RELAY_P_PIN, HIGH); relayPActive = false; }
+}
+
+
+
+
+int getSoilAverage(int pin) {
+ long sum = 0;
+ for (int i = 0; i < 12; i++) { sum += analogRead(pin); delay(5); }
+ int rawAvg = sum / 12;
+ int percentage = map(rawAvg, AIR_VALUE, WATER_VALUE, 0, 100);
+ if (percentage < 0) percentage = 0;
+ if (percentage > 100) percentage = 100;
+ return percentage;
+}
+
+
+
+
+void connectWiFi() {
+ WiFi.begin(ssid, password);
+ Serial.print("📡 Wi-Fi 連線中...");
+ unsigned long startAttemptTime = millis();
+ while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) { delay(500); Serial.print("."); }
+ if (WiFi.status() == WL_CONNECTED) Serial.println("\n✅ Wi-Fi 已成功連線！");
+}
+
+
+// =========================================================================
+// 🆕 OTA 韌體更新：透過Cloudflare Worker轉發Drive上的firmware.bin,
+// 不再經過GAS中繼+Base64編碼,直接下載原始二進位檔案寫入更新分區。
+//
+// 🔧 安全性修正：原本 client.setInsecure() 會完全跳過TLS憑證驗證，
+// 任何人只要能劫持DNS/網路路徑(例如同一WiFi下的中間人攻擊)就能偽裝成
+// OTA伺服器、發送惡意韌體，ESP32毫無防備地就會安裝。
+// 改成優先用 setCACert() 驗證憑證鏈；只有在還沒填入根憑證(OTA_ROOT_CA_PEM留空)
+// 時才退回 setInsecure() 並印出明顯警告，方便你先用舊行為驗證整個OTA流程沒問題，
+// 之後再補上憑證即可切換成安全模式，不會因為漏填憑證就直接卡死升級不了。
+// =========================================================================
+void performOTAUpdate(String targetVersion) {
+ Serial.println("🔄 收到OTA指令,目標版本：" + targetVersion + "（目前版本：" + FIRMWARE_VERSION + "）");
+
+ WiFiClientSecure client;
+
+ // 🆕 修正：原本沒有設定逾時，若下載中途網路卡頓/半死不活，httpUpdate.update()
+ // 可能永遠卡住不返回，ESP32就會停在OTA這一步、不再回到loop()打卡，
+ // GAS端的5分鐘逾時判斷也因為收不到打卡而永遠不會被觸發，導致「⏳下載中」狀態卡死。
+ // 30秒沒有任何資料進來就會判定連線逾時、讓 httpUpdate.update() 返回失敗，
+ // 之後會自動重啟繼續走正常流程，下次打卡GAS就能依照原本的5分鐘機制判斷逾時重試或失敗。
+ client.setTimeout(30000);
+
+ bool useSecureCert = (OTA_ROOT_CA_PEM != nullptr && strlen(OTA_ROOT_CA_PEM) > 0);
+ if (useSecureCert) {
+   client.setCACert(OTA_ROOT_CA_PEM);
+   Serial.println("🔒 OTA使用憑證鏈驗證(setCACert)，將拒絕憑證不符的連線");
+ } else {
+   client.setInsecure();
+   Serial.println("⚠️ 尚未設定 OTA_ROOT_CA_PEM，OTA暫時退回不驗證憑證模式(setInsecure)，"
+                   "建議盡快依程式碼註解說明取得根憑證並填入，降低中間人攻擊風險");
+ }
+
+ httpUpdate.rebootOnUpdate(true); // 更新成功後自動重啟,套用新韌體
+
+ t_httpUpdate_return ret = httpUpdate.update(client, OTA_WORKER_URL);
+ switch (ret) {
+   case HTTP_UPDATE_FAILED:
+     Serial.printf("❌ OTA失敗 (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+     break;
+   case HTTP_UPDATE_NO_UPDATES:
+     Serial.println("⚠️ OTA:Worker回應沒有可更新內容");
+     break;
+   case HTTP_UPDATE_OK:
+     Serial.println("✅ OTA成功,即將自動重啟套用新版本");
+     break;
+ }
+}
+
+
+
+
+// 統一的啟動澆水函式：記錄驗證起始濕度、啟動繼電器、開啟2分鐘驗證窗
+void startWatering(int relayPin, bool &active, unsigned long &startTime, unsigned long &duration,
+                   unsigned long ms, int freshSoilValue, int &soilAtStart,
+                   unsigned long &verifyEnd, bool &verifyPending) {
+ soilAtStart = freshSoilValue;
+ digitalWrite(relayPin, LOW);
+ active = true;
+ startTime = millis();
+ duration = ms;
+ verifyEnd = millis() + 120000; // 啟動後2分鐘進行驗證
+ verifyPending = true;
+}
+
+
+
+
+// =========================================================================
+// 🆕 統一封裝感測器讀值＋BH1750日出日落休眠/recovery狀態機＋異常訊息組合，
+// 供「正常上傳」與「離線背景取樣」共用，確保兩種情境下感測器狀態(休眠中/recovery/失敗計數)
+// 是同一份狀態機在推進，不會因為離線而各自跑出不一致的行為。
+// 注意：土壤濕度不在這裡量測，由呼叫端決定要用快取值還是強制重測後傳入。
+// =========================================================================
+SensorReading collectSensorReading(int soilJ, int soilO, int soilP,
+                                    unsigned long soilAgeJ, unsigned long soilAgeO, unsigned long soilAgeP) {
+ SensorReading r;
+ r.soilJ = soilJ; r.soilO = soilO; r.soilP = soilP;
+ r.soilAgeJ = soilAgeJ; r.soilAgeO = soilAgeO; r.soilAgeP = soilAgeP;
+
+ sensors_event_t humidity, temp;
+ bool ahtValid = aht.getEvent(&humidity, &temp);
+ r.temp = temp.temperature;
+ r.hum  = humidity.relative_humidity;
+ r.pres = bmp.readPressure() / 100.0F;
+
+ struct tm timeinfo;
+ bool haveTime = getLocalTime(&timeinfo, 3000);
+ if (haveTime && lastSunCalcYday != timeinfo.tm_yday) {
+   computeSunTimesForToday(timeinfo); // 日期變更(過了午夜)，重新計算今天的日出日落時刻
+ }
+ // 🆕 用time(nullptr)取得UTC epoch，而非用mktime(&timeinfo)反推，
+ //    避免ESP32未設定POSIX TZ字串時mktime對時區假設不一致、回補時間戳偏差整個時區的風險。
+ r.ts = haveTime ? time(nullptr) : 0;
+
+ if (lightSensorAsleep) {
+   // 休眠中不進行量測，直接用-2標記「感測器未開啟」，GAS端需辨識這個特殊值
+   r.light = -2;
+   r.light2 = lightMeter2Ready ? -2 : -1;
+   if (haveTime) {
+     int nowMinute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+     bool inNightWindow = (nowMinute >= sleepEligibleMinuteOfDay) || (nowMinute < wakeMinuteOfDay);
+     if (!inNightWindow) { wakeLightSensor(); }
+   }
+ } else {
+   r.light = lightMeter.readLightLevel();
+
+   if (lightMeter2Ready) {
+     r.light2 = lightMeter2.readLightLevel();
+     if (r.light2 < 0) {
+       bh1750BareFailCount++;
+       Serial.println("⚠️ BH1750(0x5C)讀取失敗,連續累計:" + String(bh1750BareFailCount) + "次");
+       if (bh1750BareFailCount >= MAX_FAIL_BEFORE_RECOVERY) {
+         i2cBusRecovery2_();
+         if (lightMeter2.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &I2CTwo)) {
+           lightMeter2.setMTreg(31);
+           Serial.println("✅ BH1750(0x5C) recovery後重新初始化成功");
+         } else {
+           Serial.println("❌ BH1750(0x5C) recovery後仍初始化失敗,下次上傳週期會再嘗試");
+           lightMeter2Ready = false;
+         }
+         bh1750BareFailCount = 0;
+       }
+     } else {
+       bh1750BareFailCount = 0;
+     }
+   } else {
+     r.light2 = -1;
+     bh1750BareInitRetryCount++;
+     if (bh1750BareInitRetryCount >= INIT_RETRY_INTERVAL) {
+       bh1750BareInitRetryCount = 0;
+       Serial.println("🔧 定期重試:嘗試重新初始化BH1750(0x5C)...");
+       i2cBusRecovery2_();
+       if (lightMeter2.begin(BH1750::CONTINUOUS_HIGH_RES_MODE, 0x5C, &I2CTwo)) {
+         lightMeter2.setMTreg(31);
+         lightMeter2Ready = true;
+         bh1750BareFailCount = 0;
+         Serial.println("✅ BH1750(0x5C) 定期重試初始化成功！");
+       } else {
+         Serial.println("❌ BH1750(0x5C) 定期重試仍失敗");
+       }
+     }
+   }
+
+   if (haveTime && r.light >= 0 && r.light < LUX_SLEEP_THRESHOLD) {
+     int nowMinute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+     bool inNightWindow = (nowMinute >= sleepEligibleMinuteOfDay) || (nowMinute < wakeMinuteOfDay);
+     if (inNightWindow) { sleepLightSensor(); }
+   }
+ }
+
+ String statusMessage = "正常";
+ String errorDetail = "";
+ if (!ahtValid || isnan(r.temp)) errorDetail += "AHT20溫度異常;";
+ if (isnan(r.hum))               errorDetail += "AHT20濕度異常;";
+ if (r.pres <= 0)                errorDetail += "BMP280氣壓異常;";
+ if (!lightSensorAsleep && r.light < 0) errorDetail += "BH1750(0x23)光照異常;";
+ if (!lightMeter2Ready)                         errorDetail += "BH1750(0x5C)初始化失敗;";
+ else if (!lightSensorAsleep && r.light2 < 0)   errorDetail += "BH1750(0x5C)光照異常;";
+
+ if (errorDetail != "") {
+   statusMessage = "感測器異常:" + errorDetail;
+ }
+ r.statusMessage = statusMessage;
+ return r;
+}
+
+
+// 🆕 將一筆記錄寫入環形緩衝區；滿了就覆蓋最舊的一筆(FIFO)，並在Serial留下警告
+void pushBackfillRecord(const BackfillRecord &rec) {
+ backfillBuffer[backfillHead] = rec;
+ backfillHead = (backfillHead + 1) % BACKFILL_MAX;
+ if (backfillCount < BACKFILL_MAX) {
+   backfillCount++;
+ } else {
+   Serial.println("⚠️ 斷線回補緩衝區已滿(" + String(BACKFILL_MAX) + "筆)，開始覆蓋最舊資料，較舊的離線資料將遺失");
+ }
+}
+
+
+// 🆕 WiFi斷線期間的背景取樣：沿用與正常上傳相同的60秒週期，
+//    土壤濕度不重新通電量測(沿用快取，避免無人看管時頻繁通斷探針繼電器)，
+//    其餘感測器照常讀取，暫存進環形緩衝區，等重新連線後統一回補。
+void bufferOfflineSample() {
+ unsigned long nowMs = millis();
+ unsigned long soilAgeJ = (nowMs - soilReadTimeJ) / 1000;
+ unsigned long soilAgeO = (nowMs - soilReadTimeO) / 1000;
+ unsigned long soilAgeP = (nowMs - soilReadTimeP) / 1000;
+
+ SensorReading r = collectSensorReading(cachedSoilJ, cachedSoilO, cachedSoilP, soilAgeJ, soilAgeO, soilAgeP);
+
+ BackfillRecord rec;
+ rec.ts = r.ts;
+ rec.temp = r.temp; rec.hum = r.hum; rec.pres = r.pres;
+ rec.light = r.light; rec.light2 = r.light2;
+ rec.soilJ = r.soilJ; rec.soilO = r.soilO; rec.soilP = r.soilP;
+ rec.soilAgeJ = r.soilAgeJ; rec.soilAgeO = r.soilAgeO; rec.soilAgeP = r.soilAgeP;
+ r.statusMessage.toCharArray(rec.statusMessage, sizeof(rec.statusMessage));
+ rec.valid = true;
+
+ pushBackfillRecord(rec);
+ Serial.println("💾 WiFi離線中，已暫存離線資料(緩衝區目前" + String(backfillCount) + "/" + String(BACKFILL_MAX) + "筆)" +
+                 (r.ts == 0 ? "，⚠️尚無有效時間戳(NTP尚未同步)" : ""));
+}
+
+
+// 🆕 重新連線後，把緩衝區內容依時間先後(最舊的先送)逐筆補傳給GAS。
+//    每筆之間間隔300ms，避免瞬間連續高頻請求對GAS/ESP32造成負擔。
+//
+// 🔧 修正：原本不管上傳成功或失敗，這筆都會被視為「已送出」而從緩衝區移除，
+//    等於連線不穩、GAS回應UNAUTHORIZED、或伺服器暫時錯誤時，資料會直接遺失、不會重試。
+//    改成：只有明確拿到 httpCode>0 且回應不是 "UNAUTHORIZED" 才視為成功、才會被移出緩衝區；
+//    一旦某一筆失敗就立刻停止本次回補迴圈(不繼續送後面的)，維持「最舊的資料一定排在最前面」，
+//    避免中間插斷、順序錯亂；下次連線恢復(或下一輪loop判斷WiFi仍connected)會再重新嘗試，
+//    失敗的資料永遠留在緩衝區內，直到成功送出，或緩衝區真的滿了才會依照 pushBackfillRecord()
+//    既有的FIFO規則覆蓋最舊的一筆。
+void flushBackfillBuffer() {
+ if (backfillCount == 0) return;
+
+ Serial.println("📤 WiFi已恢復，開始回補離線期間累積的 " + String(backfillCount) + " 筆資料...");
+ int oldestIndex = (backfillHead - backfillCount + BACKFILL_MAX) % BACKFILL_MAX;
+ int totalToSend = backfillCount;
+ int successCount = 0; // 從最舊端開始「連續成功」的筆數，只有這些才會被移出緩衝區
+
+ for (int i = 0; i < totalToSend; i++) {
+   if (WiFi.status() != WL_CONNECTED) {
+     Serial.println("⚠️ 回補中途WiFi又斷線，剩餘 " + String(totalToSend - successCount) + " 筆留待下次恢復連線後繼續");
+     break;
+   }
+
+   int idx = (oldestIndex + i) % BACKFILL_MAX;
+   BackfillRecord &rec = backfillBuffer[idx];
+
+   if (!rec.valid || rec.ts == 0) {
+     // 沒有有效時間戳(取樣當下NTP還沒同步過)，這筆本來就無法正確回補，視為處理完畢後跳過，
+     // 但不影響後面資料，繼續往下一筆送。
+     Serial.println("  ⚠️ 第 " + String(i + 1) + "/" + String(totalToSend) + " 筆缺少有效時間戳，略過(不會重試這一筆)");
+     successCount++;
+     continue;
+   }
+
+   String url = GAS_URL + "?key="   + WEB_API_KEY +
+                          "&fwver=" + FIRMWARE_VERSION +
+                          "&backfill=1" +
+                          "&ts="    + String((unsigned long)rec.ts) +
+                          "&temp="  + String(rec.temp) +
+                          "&hum="   + String(rec.hum) +
+                          "&pres="  + String(rec.pres) +
+                          "&light=" + String(rec.light) +
+                          "&light2=" + String(rec.light2) +
+                          "&soilJ=" + String(rec.soilJ) +
+                          "&soilO=" + String(rec.soilO) +
+                          "&soilP=" + String(rec.soilP) +
+                          "&soilAgeJ=" + String(rec.soilAgeJ) +
+                          "&soilAgeO=" + String(rec.soilAgeO) +
+                          "&soilAgeP=" + String(rec.soilAgeP) +
+                          "&status=" + urlencode(String(rec.statusMessage));
+
+   HTTPClient http;
+   http.begin(url);
+   http.setTimeout(15000);
+   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+   int httpCode = http.GET();
+   String response = "";
+   if (httpCode > 0) {
+     response = http.getString();
+     response.trim();
+   }
+   http.end();
+
+   bool success = (httpCode > 0) && (response != "UNAUTHORIZED");
+
+   if (success) {
+     Serial.println("  ✅ 回補第 " + String(i + 1) + "/" + String(totalToSend) + " 筆成功(時間戳:" + String((unsigned long)rec.ts) + ")");
+     successCount++;
+   } else {
+     Serial.println("  ❌ 回補第 " + String(i + 1) + "/" + String(totalToSend) + " 筆失敗(HTTP:" + String(httpCode) +
+                     (response.length() ? (",回應:" + response) : "") + ")，保留在緩衝區稍後重試，本次回補中止");
+     break; // 保持時間先後順序，一旦失敗就停止，避免後面的資料先被送出、順序錯亂
+   }
+   delay(300);
+ }
+
+ if (successCount > 0) {
+   backfillCount -= successCount;
+   if (backfillCount <= 0) {
+     backfillCount = 0;
+     backfillHead = 0;
+     Serial.println("✅ 離線回補完成，緩衝區已清空");
+   } else {
+     Serial.println("ℹ️ 本次成功回補 " + String(successCount) + " 筆，緩衝區保留剩餘 " + String(backfillCount) + " 筆待下次連線恢復繼續回補");
+   }
+ } else {
+   Serial.println("⚠️ 本次回補沒有任何一筆成功，緩衝區維持不變，下次連線恢復會重新嘗試");
+ }
+}
+
+
+void uploadAndCheckCommand() {
+ unsigned long nowMs = millis();
+
+
+ // 土壤濕度快取邏輯：平時每10分鐘才重新量測一次;
+ // 但只要有任一株正在澆水驗證窗期間(verifyPending),就強制每次都重新量測,確保驗證比對用的是即時真實值
+ bool needFresh = (nowMs - lastSoilReadTime >= soilReadInterval) || verifyPendingJ || verifyPendingO || verifyPendingP;
+ if (needFresh) { refreshSoilCache(); }
+ int soilJ = cachedSoilJ;
+ int soilO = cachedSoilO;
+ int soilP = cachedSoilP;
+
+
+ // 澆水驗證：啟動滿2分鐘後,比對濕度是否上升超過5%,沒有就鎖定該株馬達2小時
+ if (verifyPendingJ && nowMs >= verifyEndJ) {
+   int riseJ = soilJ - soilAtWaterStartJ;
+   if (riseJ < 5) { motorLockUntilJ = nowMs + (2UL * 60UL * 60UL * 1000UL); Serial.println("🚨 [茉莉] 澆水後濕度上升不足5%，判定失敗，鎖定2小時"); }
+   else { Serial.println("✅ [茉莉] 澆水驗證通過，濕度上升 " + String(riseJ) + "%"); }
+   verifyPendingJ = false;
+ }
+ if (verifyPendingO && nowMs >= verifyEndO) {
+   int riseO = soilO - soilAtWaterStartO;
+   if (riseO < 5) { motorLockUntilO = nowMs + (2UL * 60UL * 60UL * 1000UL); Serial.println("🚨 [桂花] 澆水後濕度上升不足5%，判定失敗，鎖定2小時"); }
+   else { Serial.println("✅ [桂花] 澆水驗證通過，濕度上升 " + String(riseO) + "%"); }
+   verifyPendingO = false;
+ }
+ if (verifyPendingP && nowMs >= verifyEndP) {
+   int riseP = soilP - soilAtWaterStartP;
+   if (riseP < 5) { motorLockUntilP = nowMs + (2UL * 60UL * 60UL * 1000UL); Serial.println("🚨 [朝天椒] 澆水後濕度上升不足5%，判定失敗，鎖定2小時"); }
+   else { Serial.println("✅ [朝天椒] 澆水驗證通過，濕度上升 " + String(riseP) + "%"); }
+   verifyPendingP = false;
+ }
+
+
+ // 各株土壤資料的新鮮度(秒)：這筆濕度數值是幾秒前實際量測的
+ unsigned long soilAgeJ = (nowMs - soilReadTimeJ) / 1000;
+ unsigned long soilAgeO = (nowMs - soilReadTimeO) / 1000;
+ unsigned long soilAgeP = (nowMs - soilReadTimeP) / 1000;
+
+
+ // 🆕 感測器讀值/BH1750休眠與recovery狀態機/異常訊息組合，改由collectSensorReading()統一處理，
+ // 與離線背景取樣(bufferOfflineSample)共用同一份邏輯，避免兩處各自維護、行為不一致。
+ SensorReading r = collectSensorReading(soilJ, soilO, soilP, soilAgeJ, soilAgeO, soilAgeP);
+ float envTemp = r.temp, envHum = r.hum, envPres = r.pres, envLight = r.light, envLight2 = r.light2;
+
+ String statusMessage = r.statusMessage;
+ if (statusMessage == "正常" && wifiDisconnectCount > 0) {
+   statusMessage = "正常(重連:" + String(wifiDisconnectCount) + "次)";
+ }
+
+
+ // 帶有金鑰驗證的正規上傳網址
+ String url = GAS_URL + "?key="   + WEB_API_KEY +
+                        "&fwver=" + FIRMWARE_VERSION +
+                        "&temp="  + String(envTemp) +
+                        "&hum="   + String(envHum) +
+                        "&pres="  + String(envPres) +
+                        "&light=" + String(envLight) +
+                        "&light2=" + String(envLight2) +
+                        "&soilJ=" + String(soilJ) +
+                        "&soilO=" + String(soilO) +
+                        "&soilP=" + String(soilP) +
+                        "&soilAgeJ=" + String(soilAgeJ) +
+                        "&soilAgeO=" + String(soilAgeO) +
+                        "&soilAgeP=" + String(soilAgeP) +
+                        "&status=" + urlencode(statusMessage);
+
+
+ Serial.println("🚀 正在將數據上傳至 Google 戰情室...");
+ HTTPClient http;
+ http.begin(url);
+ http.setTimeout(30000);
+ http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+ int httpCode = http.GET();
+ if (httpCode > 0) {
+   String response = http.getString();
+   response.trim();
+   Serial.println("📥 雲端控制碼回傳: [" + response + "]");
+
+
+   if (response == "CMD_RESET") {
+     // 休眠30秒後自動重新開機,取代原本立即重開機。
+     // 進入deep sleep後CPU完全斷電休眠,計時器喚醒時等同於重新執行setup(),
+     // 效果上就是「休眠30秒→重新開機」,繼電器等腳位狀態也會在setup()裡重新初始化為關閉。
+     Serial.println("💤 收到遠端重置指令,進入深度睡眠30秒後自動重新開機...");
+     WiFi.disconnect(true);
+     delay(200);
+     esp_sleep_enable_timer_wakeup(30ULL * 1000000ULL); // 30秒,單位為微秒
+     esp_deep_sleep_start();
+   }
+   // 🆕 收到OTA更新指令
+   else if (response.startsWith("CMD_OTA:")) {
+     String targetVersion = response.substring(8); // 取"CMD_OTA:"後面的版本字串
+     // 🔧 先結束這條上傳用的連線,再開始OTA下載,避免兩條TLS連線(GAS上傳+OTA下載)同時佔用RAM,
+     // 降低長時間運作後heap較緊繃時OTA下載中途失敗的風險。performOTAUpdate()成功會直接重開機,
+     // 失敗則直接return,不會再執行到下面的http.end()(已在這裡結束過,不會重複呼叫)。
+     http.end();
+     performOTAUpdate(targetVersion);
+     return;
+   }
+   // 明確攔截金鑰驗證失敗回應,拒絕滑入自動澆水邏輯,防止資訊中斷
+   else if (response == "UNAUTHORIZED") {
+     Serial.println("🚨 [核心錯誤] 雲端金鑰驗證失敗！請立刻檢查 ESP32 與 GAS 的 WEB_API_KEY 是否一致！");
+   }
+   // 以下六個手動指令觸發的單獨重測,探針電源由RELAY_4_PIN統一控管,這裡一樣要包進開電/斷電
+   else if (response == "PUMP_J") { probesPowerOn(); int f = getSoilAverage(SOIL_J_PIN); probesPowerOff(); cachedSoilJ = f; soilReadTimeJ = millis(); startWatering(RELAY_J_PIN, relayJActive, relayJStartTime, relayJDuration, 5000, f, soilAtWaterStartJ, verifyEndJ, verifyPendingJ); }
+   else if (response == "WASH_J") { probesPowerOn(); int f = getSoilAverage(SOIL_J_PIN); probesPowerOff(); cachedSoilJ = f; soilReadTimeJ = millis(); startWatering(RELAY_J_PIN, relayJActive, relayJStartTime, relayJDuration, 30000, f, soilAtWaterStartJ, verifyEndJ, verifyPendingJ); }
+   else if (response == "PUMP_O") { probesPowerOn(); int f = getSoilAverage(SOIL_O_PIN); probesPowerOff(); cachedSoilO = f; soilReadTimeO = millis(); startWatering(RELAY_O_PIN, relayOActive, relayOStartTime, relayODuration, 5000, f, soilAtWaterStartO, verifyEndO, verifyPendingO); }
+   else if (response == "WASH_O") { probesPowerOn(); int f = getSoilAverage(SOIL_O_PIN); probesPowerOff(); cachedSoilO = f; soilReadTimeO = millis(); startWatering(RELAY_O_PIN, relayOActive, relayOStartTime, relayODuration, 30000, f, soilAtWaterStartO, verifyEndO, verifyPendingO); }
+   else if (response == "PUMP_P") { probesPowerOn(); int f = getSoilAverage(SOIL_P_PIN); probesPowerOff(); cachedSoilP = f; soilReadTimeP = millis(); startWatering(RELAY_P_PIN, relayPActive, relayPStartTime, relayPDuration, 5000, f, soilAtWaterStartP, verifyEndP, verifyPendingP); }
+   else if (response == "WASH_P") { probesPowerOn(); int f = getSoilAverage(SOIL_P_PIN); probesPowerOff(); cachedSoilP = f; soilReadTimeP = millis(); startWatering(RELAY_P_PIN, relayPActive, relayPStartTime, relayPDuration, 30000, f, soilAtWaterStartP, verifyEndP, verifyPendingP); }
+   else {
+     // 自動澆水判斷：改用「快取值」判斷是否要澆水,不再每次上傳(60秒)都強制重新通電量測。
+     // 真正需要「即時新鮮值」的時刻(開機、指令觸發、驗證窗期間)已經由 refreshSoilCache()/needFresh 涵蓋,不受影響。
+     if (!relayJActive && nowMs >= motorLockUntilJ) {
+       if (soilJ < 30) startWatering(RELAY_J_PIN, relayJActive, relayJStartTime, relayJDuration, 5000, soilJ, soilAtWaterStartJ, verifyEndJ, verifyPendingJ);
+     }
+     if (!relayOActive && nowMs >= motorLockUntilO) {
+       if (soilO < 30) startWatering(RELAY_O_PIN, relayOActive, relayOStartTime, relayODuration, 5000, soilO, soilAtWaterStartO, verifyEndO, verifyPendingO);
+     }
+     if (!relayPActive && nowMs >= motorLockUntilP) {
+       if (soilP < 30) startWatering(RELAY_P_PIN, relayPActive, relayPStartTime, relayPDuration, 5000, soilP, soilAtWaterStartP, verifyEndP, verifyPendingP);
+     }
+   }
+ }
+ http.end();
+}
+
+
+
+
+String urlencode(String str) {
+ String encodedString = ""; char c; char code0; char code1;
+ for (int i = 0; i < str.length(); i++) {
+   c = str.charAt(i);
+   if (isalnum(c)) { encodedString += c; }
+   else {
+     code1 = (c & 0xf) + '0'; if ((c & 0xf) > 9) code1 = (c & 0xf) - 10 + 'A';
+     c = (c >> 4) & 0xf; code0 = c + '0'; if (c > 9) code0 = c - 10 + 'A';
+     encodedString += '%'; encodedString += code0; encodedString += code1;
+   }
+ }
+ return encodedString;
+}
