@@ -12,20 +12,8 @@ var TIMEZONE_OFFSET = 8;
 
 var LIGHT_CORRECTION_FACTOR = 2.9;
 
-var ELEV_ADJ_REFERENCE = 87;
-var ELEV_ADJ_MIN = 0.7;
-var ELEV_ADJ_MAX = 2.0;
-
 // 🆕 OTA逾時判定：從進入「⏳下載中」狀態算起，超過這個時間仍未偵測到版本吻合，判定失敗、停止自動重試
 var OTA_TIMEOUT_MS = 5 * 60 * 1000; // 5分鐘
-
-function getElevationAdjustmentFactor_(elevation, azimuth) {
-    if (!isBalconyLit_(elevation, azimuth)) return 1;
-    var ratio = -17.95 * Math.log(elevation) + 103.26;
-    var refRatio = -17.95 * Math.log(ELEV_ADJ_REFERENCE) + 103.26;
-    var factor = ratio / refRatio;
-    return Math.max(ELEV_ADJ_MIN, Math.min(ELEV_ADJ_MAX, factor));
-}
 
 // ======================== 📡 核心 1：ESP32 打卡大門 (doGet) ========================
 function doGet(e) {
@@ -207,17 +195,11 @@ function doGet(e) {
 
     if (updatedRows > maxRowsAllowed) {
         var deleteStartRow = updatedRows - purgeRowCount + 1;
-        // 🔧 修正：備份失敗時「不能刪除」，並且要傳 LINE 通知失敗原因，
-        // 直到備份成功前，每次打卡都會重試備份+刪除，資料只會越堆越多、不會遺失。
         try {
             backupRowsBeforePurge_(totalDataSheet, deleteStartRow, purgeRowCount);
             totalDataSheet.deleteRows(deleteStartRow, purgeRowCount);
             console.log("封存成功，已刪除 " + purgeRowCount + " 列舊資料（保留最新約7天）");
 
-            // 🔧 修正：刪除舊資料後，「仰角修正曲線」模組用來記錄進度的水位(ELEV_CURVE_LAST_ROW)
-            // 是用「資訊總表」的總列數在累加，資訊總表列數減少後水位沒有跟著減少的話，
-            // 之後會誤判成「沒有新資料」而永久停止處理。這裡刪除多少列就把水位同步扣掉多少，
-            // 確保之後還能正確判斷「有多少新資料」。
             var elevWatermarkStr = SCRIPT_PROPS.getProperty('ELEV_CURVE_LAST_ROW');
             if (elevWatermarkStr) {
                 var elevWatermark = Number(elevWatermarkStr) - purgeRowCount;
@@ -236,7 +218,7 @@ function doGet(e) {
         }
     }
     SCRIPT_PROPS.setProperty("LAST_DATA_TIME", nowTime.toString());
-    SCRIPT_PROPS.deleteProperty("LAST_BLANK_FILL_TIME"); // 🆕 恢復連線後重置回補進度，下次斷線視為全新一輪空窗
+    SCRIPT_PROPS.deleteProperty("LAST_BLANK_FILL_TIME");
 
     if (updatedRows >= 15 && !isBackfill) {
         var v = totalDataSheet.getRange("C2:E14").getValues();
@@ -269,14 +251,12 @@ function doGet(e) {
         var resetFlag = dliSheet.getRange("J2").getValue();
         var motorFlag = dliSheet.getRange("I4").getValue();
 
-        // 🆕 OTA四階段狀態機：閒置(-) → 已排程(🔄) → 下載中(⏳,含開始時間) → 完成(✅,下次打卡自動清回-) / 逾時失敗(❌,停止自動重試)
         var otaTargetVersion = SCRIPT_PROPS.getProperty("OTA_TARGET_VERSION") || "";
         var otaStatus = String(dliSheet.getRange("I7").getValue() || "");
         var otaNeeded = false;
         var versionMismatch = (otaTargetVersion !== "" && cleanFwVersion !== "" && cleanFwVersion !== otaTargetVersion);
 
         if (otaStatus.indexOf("⏳") === 0) {
-            // 目前正在下載中：檢查這次打卡的版本是否已吻合(代表上次OTA成功了)
             if (!versionMismatch) {
                 dliSheet.getRange("I7").setValue("✅ 更新完成");
                 SCRIPT_PROPS.deleteProperty("OTA_START_TIME");
@@ -284,38 +264,27 @@ function doGet(e) {
                 var otaStartStr = SCRIPT_PROPS.getProperty("OTA_START_TIME");
                 var otaStart = otaStartStr ? parseInt(otaStartStr) : nowTime;
                 if (nowTime - otaStart > OTA_TIMEOUT_MS) {
-                    // 逾時仍未成功，判定失敗，停止自動重試，避免無限鬼打牆
                     dliSheet.getRange("I7").setValue("❌ 更新逾時失敗，請重新觸發(LINE:更新韌體)");
                     SCRIPT_PROPS.deleteProperty("OTA_START_TIME");
                 } else {
-                    // 還在等待窗內，繼續嘗試
                     otaNeeded = true;
                 }
             }
         } else if (otaStatus.indexOf("🔄") === 0) {
-            // LINE剛排程，這次打卡開始執行，記錄開始時間供逾時判斷
             otaNeeded = true;
             SCRIPT_PROPS.setProperty("OTA_START_TIME", nowTime.toString());
             dliSheet.getRange("I7").setValue("⏳ 正在下載與更新韌體...");
         } else if (otaStatus.indexOf("❌") === 0) {
-            // 🔧 修正：之前這裡沒有攔截，狀態變成❌後，下一次打卡因為versionMismatch仍為true
-            // 會直接掉進下面的versionMismatch分支、無條件又觸發一次OTA，
-            // 導致「⏳下載中→逾時❌→立刻又⏳」的無限重試迴圈，完全繞過原本要停止重試的設計。
-            // 已經失敗過一次，維持otaNeeded=false，不自動重試；
-            // 要重新嘗試只能靠LINE「更新韌體」手動觸發(那會把狀態改成🔄，才會進入上面的分支)。
+            // 已經失敗過一次，維持otaNeeded=false，不自動重試
         } else if (versionMismatch) {
-            // 沒有手動觸發，但版本比對不同(例如直接改了OTA_TARGET_VERSION)，一樣視為需要更新
             otaNeeded = true;
             SCRIPT_PROPS.setProperty("OTA_START_TIME", nowTime.toString());
             dliSheet.getRange("I7").setValue("⏳ 正在下載與更新韌體...");
         } else if (otaStatus.indexOf("✅") === 0) {
-            // 顯示過一次「完成」後，這次打卡自動清回閒置
             dliSheet.getRange("I7").setValue("-");
         } else if (otaStatus === "") {
-            // 從未初始化過，補上閒置狀態
             dliSheet.getRange("I7").setValue("-");
         }
-        // 其餘情況(閒置"-"或"❌失敗"且版本已吻合)：otaNeeded維持false，不會自動重試
 
         if (resetFlag === "RESET_PENDING" || resetFlag === "YES") {
             dliSheet.getRange("J2").setValue("NORMAL");
@@ -334,7 +303,6 @@ function doGet(e) {
     return ContentService.createTextOutput(returnCmd);
 }
 
-// ======================== 太陽仰角計算與可信度評分 ========================
 function calculateSolarElevation_(date, lat, lon) {
     var rad = Math.PI / 180;
     var startOfYear = new Date(date.getFullYear(), 0, 1);
@@ -390,21 +358,20 @@ function calculateSolarPosition_(date, lat, lon) {
     cosAz = Math.max(-1, Math.min(1, cosAz));
     var azRaw = Math.acos(cosAz) / rad;
     var azimuth = (hourAngle > 0) ? (360 - azRaw) : azRaw;
-    return { elevation: elevation, azimuth: azimuth, hourAngle: hourAngle };  // 🆕 多回傳 hourAngle
+    return { elevation: elevation, azimuth: azimuth, hourAngle: hourAngle };
 }
 
 var BALCONY_AZ_MIN = 58;
 var BALCONY_AZ_MAX = 233;
-var BALCONY_EL_MIN = 10.7;         // 🆕 日出後直射光下限（觀測值，取代舊的20.4）
-var BALCONY_EL_DIRECT_MAX = 87;    // 🆕 直射轉散射的固定門檻（觀測值，取代舊的84）
+var BALCONY_EL_MIN = 10.7;
+var BALCONY_EL_DIRECT_MAX = 87;
 
-// 🆕 取代 isBalconyLit_：回傳 'direct'（直射）/ 'diffuse'（散射）/ 'none'（方位角外或未日出，無光）
 function getLightType_(elevation, azimuth) {
     var inAzimuthWindow = (azimuth >= BALCONY_AZ_MIN && azimuth <= BALCONY_AZ_MAX);
-    if (!inAzimuthWindow) return 'none';           // 方位角決定「有沒有光」的時間窗
-    if (elevation < BALCONY_EL_MIN) return 'none'; // 未達日出仰角
+    if (!inAzimuthWindow) return 'none';
+    if (elevation < BALCONY_EL_MIN) return 'none';
     if (elevation <= BALCONY_EL_DIRECT_MAX) return 'direct';
-    return 'diffuse';                              // >87° 固定判定為散射，直到日落
+    return 'diffuse';
 }
 
 function estimateShadowTransitionTime_(dateStr, lat, lon) {
@@ -417,7 +384,9 @@ function estimateShadowTransitionTime_(dateStr, lat, lon) {
     for (var m = 0; m <= 14 * 60; m++) {
         var t = new Date(baseDate.getTime() + m * 60000);
         var pos = calculateSolarPosition_(t, lat, lon);
-        var lit = isBalconyLit_(pos.elevation, pos.azimuth);
+        // 🔧 修正：isBalconyLit_已被getLightType_取代但這裡沒同步更新，導致此函式呼叫不存在的函式而報錯。
+        // 改為用getLightType_判斷「有沒有光」(direct或diffuse都算有光，只有none算沒光)，與doGet()等其他地方的判斷基準一致。
+        var lit = (getLightType_(pos.elevation, pos.azimuth) !== 'none');
         if (prevLit === true && lit === false) {
             var diffFromNoon = Math.abs((t.getHours() * 60 + t.getMinutes()) - 12 * 60);
             if (diffFromNoon < minDiffFromNoon) {
@@ -429,9 +398,8 @@ function estimateShadowTransitionTime_(dateStr, lat, lon) {
     }
     return transitionTime;
 }
-// ======================== 🔄 資料驅動仰角修正公式（滾動式自動校正）========================
 var ELEV_RATIO_TABLE_PROP = 'ELEV_RATIO_TABLE';
-var ELEV_RATIO_MIN_SAMPLES = 5; // 樣本數低於此門檻的區間視為不可靠，查表時跳過改找鄰近區間
+var ELEV_RATIO_MIN_SAMPLES = 5;
 
 function recalibrateElevationCorrectionFormula() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -460,7 +428,6 @@ function recalibrateElevationCorrectionFormula() {
     + '，PM區間數=' + Object.keys(table.PM).length);
 }
 
-// 查表：優先找同時段最近的區間，找不到才跨到對向時段
 function lookupElevationRatio_(elevation, period) {
   var tableStr = SCRIPT_PROPS.getProperty(ELEV_RATIO_TABLE_PROP);
   if (!tableStr) return null;
@@ -479,9 +446,8 @@ function lookupElevationRatio_(elevation, period) {
     if (fallback[binIndex + d2] !== undefined) return fallback[binIndex + d2];
     if (fallback[binIndex - d2] !== undefined) return fallback[binIndex - d2];
   }
-  return null; // 完全查不到（通常是剛部署、資料還太少）
+  return null;
 }
-// ======================== 🛡️ 核心 3 函式：資安過濾 ========================
 function sanitizeInput(val, isNumber) {
     if (val === undefined || val === null) return isNumber ? 0 : "";
     var str = val.toString().trim();
@@ -490,10 +456,6 @@ function sanitizeInput(val, isNumber) {
     return str;
 }
 
-// ======================== 🛡️ 核心 1 函式：雲端看門狗 ========================
-// 🆕 改為「逐分鐘回補」：每次觸發時，把上次已補到的分鐘 到 現在之間所有漏掉的分鐘
-// 都各補一列「斷線」，而不是只補「現在」這一列，這樣就算觸發器頻率只有5分鐘一次，
-// 補齊後的「每小時統計表」也能還原出接近真實的逐分鐘斷線比例。
 function checkEspStatusAndInsertBlank() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var dataSheet = ss.getSheetByName("資訊總表");
@@ -510,17 +472,14 @@ function checkEspStatusAndInsertBlank() {
     var lastFillStr = SCRIPT_PROPS.getProperty("LAST_BLANK_FILL_TIME");
     var fillFrom = lastFillStr ? parseInt(lastFillStr) : lastDataTime;
 
-    // 從fillFrom所在分鐘的下一分鐘開始補，補到「現在」所在分鐘的前一分鐘為止
-    // (當下這分鐘還沒走完，不補，避免跟稍後真正的正常打卡或斷線列衝突)
     var startMinute = Math.floor(fillFrom / 60000) + 1;
     var endMinute = Math.floor(nowTime / 60000);
     var minutesToFill = endMinute - startMinute;
     if (minutesToFill <= 0) return;
 
-    var MAX_FILL_PER_RUN = 60; // 單次最多補60列，避免長時間斷線一次補太多拖慢執行
+    var MAX_FILL_PER_RUN = 60;
     var fillCount = Math.min(minutesToFill, MAX_FILL_PER_RUN);
 
-    // 資訊總表是新到舊排序，row2是最新，所以要從「最新的待補分鐘」往「最舊的待補分鐘」組陣列
     var rows = [];
     for (var m = fillCount - 1; m >= 0; m--) {
         var minuteEpochMs = (startMinute + m) * 60000;
@@ -541,11 +500,9 @@ function checkEspStatusAndInsertBlank() {
         Utilities.formatDate(new Date(lastFilledMinuteEpoch), "GMT+8", "HH:mm") + '）' +
         (minutesToFill > MAX_FILL_PER_RUN ? '，尚餘 ' + (minutesToFill - fillCount) + ' 分鐘待下次執行繼續補' : ''));
 }
-// ======================== 🗄️ Purge前自動封存（依月份分頁） ========================
 function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
     var archiveId = SCRIPT_PROPS.getProperty("ARCHIVE_FILE_ID");
     if (!archiveId) {
-        // 🔧 修正：找不到封存檔設定時，改成拋出例外，讓呼叫端(doGet)知道備份失敗、不能刪除資料
         throw new Error("尚未設定 ARCHIVE_FILE_ID，請先執行 setupArchiveFile 建立封存檔");
     }
 
@@ -576,8 +533,6 @@ function backupRowsBeforePurge_(sourceSheet, startRow, numRows) {
         rowsByMonth[monthKey].push(row);
     }
 
-    // 🔧 修正：headers 從 20 欄補齊到跟「資訊總表」實際一致的 23 欄，
-    // 原本只有 20 欄會讓「光罩位置」「裸版位置」「即時天氣觀測」這 3 欄在封存時被截斷遺失。
     var headers = ["日期", "時間", "溫度", "濕度", "氣壓", "校正光照", "PPFD",
                     "土壤J", "土壤O", "土壤P", "狀態", "累積J", "累積O", "累積P",
                     "日期時間(輔助,無秒)", "原始光照(未校正)", "太陽仰角",
@@ -610,9 +565,8 @@ function padRowsToLength_(rows, targetLength) {
     });
 }
 
-// 🆕 備份失敗時的 LINE 通知（加上節流，避免每分鐘打卡都連續洗版）
 function notifyBackupFailure_(reason) {
-    var THROTTLE_MS = 30 * 60 * 1000; // 30分鐘內只通知一次
+    var THROTTLE_MS = 30 * 60 * 1000;
     var lastNotifyStr = SCRIPT_PROPS.getProperty("LAST_BACKUP_FAIL_NOTIFY");
     var nowTime = new Date().getTime();
     if (lastNotifyStr && (nowTime - parseInt(lastNotifyStr) < THROTTLE_MS)) {
@@ -624,7 +578,6 @@ function notifyBackupFailure_(reason) {
     SCRIPT_PROPS.setProperty("LAST_BACKUP_FAIL_NOTIFY", nowTime.toString());
 }
 
-// ======================== 🛡️ 核心 4 函式：每日 DLI 歷史紀錄結算與鎖定引擎 ========================
 function archiveDailyDLI() {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var sheet = ss.getSheetByName("DLI統計");
@@ -837,7 +790,6 @@ function computeAndWriteDailyStats_(todayStr, todayRowsInput) {
 
     console.log("已寫入 " + todayStr + " 每日統計表（實測轉換" + empiricalTransition + "／預估轉換" + estimatedTransition + "／正常" + sampleRate + "）");
 }
-// ======================== 正規 LINE 推播引擎 ========================
 function sendLinePushMessage(textMessage) {
     var url = "https://api.line.me/v2/bot/message/push";
     var payload = { "to": LINE_USER_ID, "messages": [{ "type": "text", "text": textMessage }] };
@@ -853,7 +805,6 @@ function sendLinePushMessage(textMessage) {
     }
 }
 
-// ======================== 🤖 LINE Bot 接收大門 ========================
 function doPost(e) {
     if (typeof e === 'undefined') return ContentService.createTextOutput("OK");
     var msg = JSON.parse(e.postData.contents);
@@ -912,7 +863,6 @@ function doPost(e) {
                 }
             }
             else {
-                // 🆕 補齊所有實際支援的指令，避免使用者猜不到還有哪些可用
                 replyText(replyToken,
                     "🤔 系統聽不懂這句話。可用指令：\n" +
                     "• 看狀態\n" +
@@ -928,7 +878,6 @@ function doPost(e) {
     return ContentService.createTextOutput("OK");
 }
 
-// ======================== 📱 LINE 通訊與按鈕引擎區 ========================
 function replyText(replyToken, text) {
     fetchLineApi({ "replyToken": replyToken, "messages": [{ "type": "text", "text": text }] });
 }
@@ -973,7 +922,6 @@ function fetchLineApi(payload) {
     }
 }
 
-// ======================== 📊 QuickChart 圖表生成 ========================
 function buildQuickChartUrl(chartType, sheet) {
     var lastRow = sheet.getLastRow();
     var numRows = Math.min(15, lastRow - 1);
@@ -1050,7 +998,6 @@ function getQuickChartShortUrl(chartConfig) {
     }
 }
 
-// ======================== 🗄️ 封存機制：每小時統計表 ========================
 const ARCHIVE_CONFIG = {
   SOURCE_SHEET_NAME: '資訊總表',
   ARCHIVE_SHEET_NAME: '每小時統計表',
@@ -1096,17 +1043,10 @@ function getOrCreateArchiveSheet(ss) {
   return archive;
 }
 
-// 🆕 抽出共用的「計算指定小時桶統計」邏輯，讓正常封存與回補後重算都走同一份邏輯，
-// 避免兩處各自維護、行為不一致。
-// 🔧 同時修正：原本st === '正常'是嚴格比對，會讓「正常(重連:1次)」這類重連後的狀態字串
-// 被誤判成「感測器異常」而不是「正常」，拖低取樣率、拉高感測器異常率。
-// 改成indexOf('正常') === 0，只要是「正常」開頭都算正常。
 function computeHourlyStatsForBucket_(source, targetBucketTime) {
   var lastRow = source.getLastRow();
   if (lastRow < 2) return null;
 
-  // 🔧 重算歷史時段時，資料可能落在表格深處，不能只掃最新150列，
-  // 用「目標時段結束時間到現在」估算需要掃多少列(每分鐘約1列)，並保留緩衝空間。
   var now = new Date();
   var minutesSinceBucketEnd = Math.ceil((now.getTime() - (targetBucketTime.getTime() + 3600000)) / 60000);
   var scanRows = Math.min(lastRow - 1, Math.max(200, minutesSinceBucketEnd + 200));
@@ -1156,9 +1096,6 @@ function computeHourlyStatsForBucket_(source, targetBucketTime) {
   };
 }
 
-// 🆕 回補資料進來後，如果它所屬的小時「已經」被封存過，就用最新資料重算覆蓋那一列。
-// 如果那個小時還沒被封存過(還在進行中，或還沒輪到觸發器)，就不動它，
-// 交給原本排程的archiveHourlyIfNeeded()處理，避免搶插入順序、造成重複列。
 function recomputeHourlyBucket_(targetBucketTime) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var source = ss.getSheetByName(ARCHIVE_CONFIG.SOURCE_SHEET_NAME);
@@ -1236,9 +1173,6 @@ function archiveHourlyIfNeeded() {
 }
 
 
-// ============================================================
-// 🌤️ CWA 天氣預報快照模組
-// ============================================================
 const CWA_LOCATION = '恆春鎮';
 const CWA_SNAPSHOT_START_COL = 1;
 
@@ -1476,11 +1410,6 @@ function updateWeatherSnapshot_1Week() {
   Logger.log('1週預報快照更新完成:' + current[0]);
 }
 
-
-// ============================================================
-// 🧰 手動 / 一次性工具函式（不會被觸發器自動呼叫，需要時才手動執行一次）
-// ============================================================
-
 function triggerESP32Reset() {
     SpreadsheetApp.getActiveSpreadsheet().getSheetByName("即時訊息").getRange("J2").setValue("RESET_PENDING");
     SpreadsheetApp.getUi().alert("🚀【指令已下達】\n遠端重置訊號已就緒！");
@@ -1538,7 +1467,6 @@ function backfillDailyStatsTableHistory() {
     }
     console.log("歷史資料補算完成，共 " + dateList.length + " 天");
 }
-// ======================== 🤖 AI 匯出模式：跨分頁掃描 / 公式+值輸出 ========================
 
 function handleAIExport_(e) {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -1604,9 +1532,6 @@ function handleAIExport_(e) {
     return ContentService.createTextOutput(JSON.stringify(result))
         .setMimeType(ContentService.MimeType.JSON);
 }
-// ============================================================
-// 🌤️ 仰角修正曲線統計模組（2026/07新增）
-// ============================================================
 const ELEV_CURVE_SHEET_NAME = '仰角修正曲線';
 const ELEV_CURVE_BIN_SIZE = 2;
 const ELEV_CURVE_MIN_CONFIDENCE = 90;
@@ -1677,7 +1602,6 @@ function updateElevationCorrectionCurve() {
   }
   var scanRows = Math.min(newRowCount, 5000);
 
-  // 🆕 改讀 A~V 全部欄位，因為要用日期(A)+時間(B)重建時間戳算 hourAngle
   var data = source.getRange(2, 1, scanRows, 22).getValues();
 
   var carryInState = SCRIPT_PROPS.getProperty('BARE_LOCATION_STATE') || '';
@@ -1685,7 +1609,7 @@ function updateElevationCorrectionCurve() {
   var locationStates = [];
   var currentState = carryInState;
   for (var c = 0; c < chronological.length; c++) {
-    var marker = chronological[c][21]; // V欄 裸版位置（人為移動感光器標記，維持原邏輯）
+    var marker = chronological[c][21];
     if (marker && marker.toString().trim() !== '') {
       currentState = marker.toString().trim();
     }
@@ -1699,14 +1623,13 @@ function updateElevationCorrectionCurve() {
   var skippedNoTime = 0;
 
   for (var i = 0; i < data.length; i++) {
-    var dateVal = data[i][0];   // A 日期
-    var timeVal = data[i][1];   // B 時間
-    var covered = data[i][15];  // P 未修正原始值
-    var elevation = data[i][16];// Q 仰角
-    var bare = data[i][19];     // T 光照(裸版)
+    var dateVal = data[i][0];
+    var timeVal = data[i][1];
+    var covered = data[i][15];
+    var elevation = data[i][16];
+    var bare = data[i][19];
 
     if (elevation === '' || elevation === null || isNaN(elevation)) continue;
-    // 🆕 移除可信度≥90門檻，改用陽台幾何下限，讓日出到日落全區間都納入統計
     if (Number(elevation) < BALCONY_EL_MIN) continue;
 
     var stateStr = locationStates[i] || '';
@@ -1719,7 +1642,6 @@ function updateElevationCorrectionCurve() {
     if (isSaturatedOrInvalid_(bare)) { skippedSaturated++; continue; }
 
     if (!(dateVal instanceof Date) || !(timeVal instanceof Date)) { skippedNoTime++; continue; }
-    // 🆕 重建當下時間戳，算真太陽時 hourAngle，判斷正午前/正午後
     var ts = new Date(dateVal.getFullYear(), dateVal.getMonth(), dateVal.getDate(),
                        timeVal.getHours(), timeVal.getMinutes(), timeVal.getSeconds());
     var pos = calculateSolarPosition_(ts, SENSOR_LAT, SENSOR_LON);
@@ -1738,7 +1660,7 @@ function updateElevationCorrectionCurve() {
   var keys = Object.keys(bins).sort(function(a, b) {
     var ba = bins[a], bb = bins[b];
     if (ba.binIndex !== bb.binIndex) return ba.binIndex - bb.binIndex;
-    return ba.period < bb.period ? -1 : 1; // AM排在PM前
+    return ba.period < bb.period ? -1 : 1;
   });
   var outputRows = keys.map(function(k) {
     var b = bins[k];
@@ -1774,11 +1696,9 @@ function updateElevationCorrectionCurve() {
     + ' 筆、過濾遮蔭 ' + skippedShaded + ' 筆、缺時間戳 ' + skippedNoTime
     + ' 筆)，累積 ' + outputRows.length + ' 個(仰角區間×時段)組合，目前進度 '
     + (lastProcessedRow + scanRows) + '/' + totalRows);
-  SCRIPT_PROPS.setProperty('ELEV_CURVE_LAST_ROW', (lastProcessedRow + scanRows).toString());
 
-  recalibrateElevationCorrectionFormula(); // 🆕 曲線更新後立刻重新校正公式，達成滾動式自動變更基數
-
-  console.log('仰角修正曲線更新完成...');}
+  recalibrateElevationCorrectionFormula();
+}
 function resetElevationCorrectionCurve() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var curveSheet = ss.getSheetByName(ELEV_CURVE_SHEET_NAME);
@@ -1791,6 +1711,6 @@ function resetElevationCorrectionCurve() {
   console.log('仰角修正曲線統計已重置，下次執行updateElevationCorrectionCurve將從頭掃描全部歷史資料');
   }
 function setOtaTargetVersion() {
-    SCRIPT_PROPS.setProperty("OTA_TARGET_VERSION", "ESP32072102"); // 🔧 改成你這次要推送的版本號
+    SCRIPT_PROPS.setProperty("OTA_TARGET_VERSION", "ESP32072102");
     SpreadsheetApp.getUi().alert("✅ OTA目標版本已設定為：ESP32072102");
 }
